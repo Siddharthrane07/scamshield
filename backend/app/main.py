@@ -1,13 +1,16 @@
 from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from app.core.config import get_settings
+from app.core.database import init_tables
+from app.routers.scan import router as scan_router
 
 settings = get_settings()
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Startup event logic
+    # Initialize database connection and verify/create tables
+    await init_tables()
     yield
     # Shutdown event logic
 
@@ -19,6 +22,9 @@ app = FastAPI(
     lifespan=lifespan
 )
 
+# Register scan router
+app.include_router(scan_router)
+
 
 @app.get("/health")
 async def health():
@@ -27,3 +33,4 @@ async def health():
         "app": settings.APP_NAME,
         "version": settings.APP_VERSION
     }
+

@@ -21,3 +21,9 @@ class IntelligenceException(ScamShieldException):
 class MLInferenceException(ScamShieldException):
     """Raised when the ML model inference fails."""
     pass
+
+
+class MarathiLanguageException(ScamShieldException):
+    """Raised when Marathi text is detected, which is strictly excluded from processing."""
+    pass
+

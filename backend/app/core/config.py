@@ -22,6 +22,14 @@ class Settings(BaseSettings):
     SANDBOX_TIMEOUT_SECONDS: int
     CACHE_TTL_HOURS: int
 
+    @property
+    def postgres_url(self) -> str:
+        return f"postgresql+asyncpg://{self.POSTGRES_USER}:{self.POSTGRES_PASSWORD}@{self.POSTGRES_HOST}:{self.POSTGRES_PORT}/{self.POSTGRES_DB}"
+
+    @property
+    def sqlite_url(self) -> str:
+        return "sqlite+aiosqlite:///./scamshield.db"
+
     model_config = SettingsConfigDict(
         env_file=".env",
         env_file_encoding="utf-8",
@@ -32,3 +40,4 @@ class Settings(BaseSettings):
 @lru_cache
 def get_settings() -> Settings:
     return Settings()
+
