@@ -1,10 +1,33 @@
-venv
-.env 
-.env.example
-app/__pycache__
-config/__pycache__
-app/services/__pycache__
-app/routers/__pycache__
-app/models/__pycache__
-app/utils/__pycache__
-app/core/__pycache__
+# Virtual Environment
+venv/
+.venv/
+
+# Environment files
+.env
+.env.*
+
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# SQLite
+*.db
+*.sqlite3
+
+# VSCode
+.vscode/
+
+# Logs
+*.log
+
+# Build
+dist/
+build/
+
+# Models
+backend/model_assets/*.onnx
+
+# OS
+.DS_Store
+Thumbs.db
