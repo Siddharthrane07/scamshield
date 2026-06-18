@@ -1,4 +1,5 @@
 from functools import lru_cache
+from urllib.parse import quote_plus
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -24,7 +25,9 @@ class Settings(BaseSettings):
 
     @property
     def postgres_url(self) -> str:
-        return f"postgresql+asyncpg://{self.POSTGRES_USER}:{self.POSTGRES_PASSWORD}@{self.POSTGRES_HOST}:{self.POSTGRES_PORT}/{self.POSTGRES_DB}"
+        # URL-encode the password to safely handle special characters like '@'
+        encoded_password = quote_plus(self.POSTGRES_PASSWORD)
+        return f"postgresql+asyncpg://{self.POSTGRES_USER}:{encoded_password}@{self.POSTGRES_HOST}:{self.POSTGRES_PORT}/{self.POSTGRES_DB}"
 
     @property
     def sqlite_url(self) -> str:

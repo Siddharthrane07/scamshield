@@ -1,8 +1,10 @@
 import logging
 from typing import AsyncGenerator
+from sqlalchemy import text
 from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker, AsyncSession
 from sqlalchemy.orm import declarative_base
 from app.core.config import get_settings
+
 
 logger = logging.getLogger("scamshield.database")
 settings = get_settings()
@@ -31,7 +33,7 @@ async def init_db_engine():
         # Verify connectivity
         async with temp_engine.connect() as conn:
             # Check basic connection
-            await conn.execute(Base.metadata.clear())
+            await conn.execute(text("SELECT 1"))
         
         engine = temp_engine
         logger.info("Successfully connected to PostgreSQL.")
