@@ -6,7 +6,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.database import get_db
 from app.core.exceptions import MarathiLanguageException, ScamShieldException
 from app.models.schemas import ScanTextRequest, ScanResponse
-from app.services.ocr import OCRService
+from app.services.ocr.ocr_engine import OCRPipeline
 from app.services.detector import DetectorService
 from app.services.cache_service import CacheService
 from app.services.scoring import ScoringService
@@ -156,8 +156,9 @@ async def scan_image_endpoint(
         # Read uploaded image bytes
         image_bytes = await file.read()
         
-        # Layer 2: OpenCV + PyTesseract OCR extraction
-        extracted_ocr_text = OCRService.extract_text(image_bytes)
+        # Layer 2: OpenCV + PaddleOCR + Tesseract OCR extraction
+        ocr_result = OCRPipeline.process_image(image_bytes)
+        extracted_ocr_text = ocr_result["clean_text"]
         
         if not extracted_ocr_text.strip():
             raise HTTPException(
