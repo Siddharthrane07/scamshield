@@ -16,12 +16,12 @@ from .ocr_postprocess import extract_entities
 from .models import OCRBlock
 
 # Module-level singletons
-paddle_en = PaddleOCR(lang='en', use_mkldnn=True, show_log=False)
-paddle_hi = PaddleOCR(lang='hi', use_mkldnn=True, show_log=False)
+paddle_en = PaddleOCR(lang='en', enable_mkldnn=False)
+paddle_hi = PaddleOCR(lang='hi', enable_mkldnn=False)
 
 # Regex to detect Devanagari Unicode characters
 DEVANAGARI_RE = re.compile(r'[\u0900-\u097F]')
-
+    
 
 def calculate_iou(boxA: List[List[int]], boxB: List[List[int]]) -> float:
     """Calculate Intersection over Union between two bounding boxes."""
@@ -48,13 +48,37 @@ def has_devanagari(text: str) -> bool:
 def parse_paddle_result(result, script: str) -> List[OCRBlock]:
     """Parse PaddleOCR result into a list of OCRBlock objects."""
     blocks = []
-    if result and result[0]:
-        for line in result[0]:
-            bbox, (text, conf) = line
+    if not result or not result[0]:
+        return blocks
+
+    first_res = result[0]
+    if isinstance(first_res, dict):
+        # PaddleOCR 3.x dictionary format
+        dt_polys = first_res.get('dt_polys', [])
+        rec_texts = first_res.get('rec_texts', [])
+        rec_scores = first_res.get('rec_scores', [])
+        for i in range(len(rec_texts)):
+            bbox = dt_polys[i] if i < len(dt_polys) else None
+            if bbox is not None:
+                # Convert numpy array to list of lists structure
+                bbox = bbox.tolist() if hasattr(bbox, 'tolist') else bbox
+            text = rec_texts[i]
+            conf = rec_scores[i] if i < len(rec_scores) else 0.0
             blocks.append(OCRBlock(
                 bbox=bbox, text=text, confidence=conf,
                 script=script, source='paddle'
             ))
+    else:
+        # PaddleOCR 2.x list/tuple format
+        for line in first_res:
+            try:
+                bbox, (text, conf) = line
+                blocks.append(OCRBlock(
+                    bbox=bbox, text=text, confidence=conf,
+                    script=script, source='paddle'
+                ))
+            except (ValueError, TypeError):
+                continue
     return blocks
 
 
