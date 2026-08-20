@@ -31,3 +31,12 @@ backend/model_assets/*.onnx
 # OS
 .DS_Store
 Thumbs.db
+
+# OCR Benchmark Test Images
+*.jpg
+*.jpeg
+*.png
+*.webp
+
+# OCR Diagnostic Reports
+*.json
