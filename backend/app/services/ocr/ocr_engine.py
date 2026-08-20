@@ -3,7 +3,6 @@ import re
 import cv2
 import uuid
 import numpy as np
-import pytesseract
 from dataclasses import dataclass
 from typing import List, Dict, Any, Tuple
 from paddleocr import PaddleOCR
@@ -15,9 +14,8 @@ from .text_reconstructor import reconstruct_text
 from .ocr_postprocess import extract_entities
 from .models import OCRBlock
 
-# Module-level singletons
-paddle_en = PaddleOCR(lang='en', enable_mkldnn=False)
-paddle_hi = PaddleOCR(lang='hi', enable_mkldnn=False)
+# Models will be instantiated inside the OCRPipeline class
+# to allow for proper cold-start measurement and memory management.
 
 # Regex to detect Devanagari Unicode characters
 DEVANAGARI_RE = re.compile(r'[\u0900-\u097F]')
@@ -83,8 +81,14 @@ def parse_paddle_result(result, script: str) -> List[OCRBlock]:
 
 
 class OCRPipeline:
-    @classmethod
-    def run_paddle_engine(cls, img_rgb: np.ndarray) -> List[OCRBlock]:
+    def __init__(self):
+        """Initialize OCR models (cold-start).
+        Both models use PP-OCRv3 (stable on AMD CPU w/o MKLDNN).
+        """
+        self.paddle_en = PaddleOCR(lang='en', enable_mkldnn=False, ocr_version='PP-OCRv3', use_angle_cls=False)
+        self.paddle_hi = PaddleOCR(lang='hi', enable_mkldnn=False, ocr_version='PP-OCRv3', use_angle_cls=False)
+
+    def run_paddle_engine(self, img_rgb: np.ndarray) -> List[OCRBlock]:
         """
         Stage 2: Dual-model OCR with intelligent script-based merging.
         
@@ -98,11 +102,11 @@ class OCRPipeline:
            - Non-overlapping blocks are kept from both models
         """
         # --- Pass 1: English OCR on full image ---
-        result_en = paddle_en.ocr(img_rgb)
+        result_en = self.paddle_en.ocr(img_rgb)
         blocks_en = parse_paddle_result(result_en, 'en')
 
         # --- Pass 2: Hindi (Devanagari) OCR on full image ---
-        result_hi = paddle_hi.ocr(img_rgb)
+        result_hi = self.paddle_hi.ocr(img_rgb)
         blocks_hi = parse_paddle_result(result_hi, 'hi')
 
         # --- Pass 3: Script-aware merge ---
@@ -155,30 +159,10 @@ class OCRPipeline:
         filtered_blocks.sort(key=lambda b: (b.bbox[0][1], b.bbox[0][0]))
         return filtered_blocks
 
-    @classmethod
-    def run_tesseract_fallback(cls, img_rgb: np.ndarray) -> List[OCRBlock]:
-        """Tesseract fallback when PaddleOCR quality is insufficient."""
-        data = pytesseract.image_to_data(
-            img_rgb, lang='eng+hin',
-            config='--oem 3 --psm 6',
-            output_type=pytesseract.Output.DICT
-        )
-        blocks = []
-        for i in range(len(data['text'])):
-            text = data['text'][i].strip()
-            conf = int(data['conf'][i]) / 100.0
-            if text and conf >= 0.55:
-                x, y, w, h = data['left'][i], data['top'][i], data['width'][i], data['height'][i]
-                bbox = [[x, y], [x+w, y], [x+w, y+h], [x, y+h]]
-                script = 'hi' if has_devanagari(text) else 'en'
-                blocks.append(OCRBlock(
-                    bbox=bbox, text=text, confidence=conf,
-                    script=script, source='tesseract'
-                ))
-        return blocks
+    # Tesseract fallback removed — benchmark showed 0 fallback triggers across
+    # 46 images, and Tesseract is not installed. Per project_master.mk §8.3.
 
-    @classmethod
-    def compute_quality(cls, blocks: List[OCRBlock], entities: Dict[str, Any]) -> float:
+    def compute_quality(self, blocks: List[OCRBlock], entities: Dict[str, Any]) -> float:
         """Compute OCR quality score based on confidence, entities, and text density."""
         if not blocks:
             return 0.0
@@ -191,8 +175,7 @@ class OCRPipeline:
         density = min(1.0, total_len / 50.0)
         return (0.4 * avg_confidence) + (0.3 * entity_presence) + (0.3 * density)
 
-    @classmethod
-    def process_pipeline(cls, img_rgb: np.ndarray, blocks: List[OCRBlock], image_height: int) -> Tuple[str, Dict[str, Any], float]:
+    def process_pipeline(self, img_rgb: np.ndarray, blocks: List[OCRBlock], image_height: int) -> Tuple[str, Dict[str, Any], float]:
         """Run stages 4-7: filter artifacts, rank, reconstruct, extract entities."""
         # Stage 4: Artifact filtering
         filtered = filter_artifacts(blocks, image_height)
@@ -203,16 +186,15 @@ class OCRPipeline:
         # Stage 7: Entity extraction
         entities = extract_entities(clean_text)
 
-        quality = cls.compute_quality(normalized_blocks, entities)
+        quality = self.compute_quality(normalized_blocks, entities)
         return clean_text, entities, quality
 
-    @classmethod
-    def process_image(cls, image_bytes: bytes) -> Dict[str, Any]:
+    def process_image(self, image_bytes: bytes) -> Dict[str, Any]:
         """
-        Full 9-stage OCR pipeline.
+        OCR pipeline (Tesseract fallback removed).
         Stage 1: Preprocess → Stage 2: Dual PaddleOCR → Stage 3: Filter low-conf
         Stage 4: Artifact filter → Stage 5: Rank → Stage 6: Reconstruct
-        Stage 7: Entity extraction → Stage 8: Tesseract fallback → Stage 9: Output
+        Stage 7: Entity extraction → Stage 8: Output
         """
         start_time = time.perf_counter()
 
@@ -222,26 +204,12 @@ class OCRPipeline:
         image_height = img_rgb.shape[0]
 
         # Stage 2: Dual-model PaddleOCR
-        blocks = cls.run_paddle_engine(img_rgb)
+        blocks = self.run_paddle_engine(img_rgb)
 
         # Run stages 4-7
-        clean_text, entities, quality = cls.process_pipeline(img_rgb, blocks, image_height)
+        clean_text, entities, quality = self.process_pipeline(img_rgb, blocks, image_height)
 
-        fallback_used = False
         final_blocks = blocks
-
-        # Stage 8: Tesseract fallback if quality is poor
-        if quality < 0.55:
-            fallback_blocks = cls.run_tesseract_fallback(img_rgb)
-            fallback_clean, fallback_entities, fallback_quality = cls.process_pipeline(
-                img_rgb, fallback_blocks, image_height
-            )
-            if fallback_quality > quality:
-                fallback_used = True
-                clean_text = fallback_clean
-                entities = fallback_entities
-                quality = fallback_quality
-                final_blocks = fallback_blocks
 
         # Raw text for logging
         raw_text = "\n".join(b.text for b in final_blocks)
@@ -264,7 +232,7 @@ class OCRPipeline:
             "avg_confidence": avg_conf,
             "dark_mode_detected": prep_res["dark_mode_detected"],
             "devanagari_detected": devnagari_detected,
-            "fallback_used": fallback_used,
+            "fallback_used": False,  # Tesseract removed
             "execution_time_ms": exec_time_ms,
             "confidence_statistics": {
                 "blocks_count": len(final_blocks),

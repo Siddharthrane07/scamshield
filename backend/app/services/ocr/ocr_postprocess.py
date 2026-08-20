@@ -2,6 +2,14 @@ import re
 from typing import Dict, List, Tuple
 from urllib.parse import urlparse
 
+def sanitize_url_token(url: str) -> str:
+    """Fix common OCR typos specific to URLs."""
+    url = url.replace("https:II", "https://")
+    url = url.replace("http:II", "http://")
+    url = url.replace("bit.Iy", "bit.ly")
+    url = url.replace("bit.IY", "bit.ly")
+    return url
+
 def extract_entities(clean_text: str) -> Dict[str, List[str]]:
     # Aadhaar Redaction
     aadhaar_pattern = re.compile(r'\b\d{4}\s\d{4}\s\d{4}\b')
@@ -11,6 +19,7 @@ def extract_entities(clean_text: str) -> Dict[str, List[str]]:
     # URLs (including scheme-less)
     url_pattern = re.compile(r'(?:https?://)?(?:www\.)?[-a-zA-Z0-9@:%._\+~#=]{1,256}\.[a-zA-Z0-9()]{1,6}\b(?:[-a-zA-Z0-9()@:%_\+.~#?&//=]*)', re.IGNORECASE)
     urls = list(set(url_pattern.findall(clean_text)))
+    urls = [sanitize_url_token(url) for url in urls]
     
     # Domains from URLs
     domains = []

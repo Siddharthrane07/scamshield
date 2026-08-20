@@ -157,7 +157,12 @@ async def scan_image_endpoint(
         image_bytes = await file.read()
         
         # Layer 2: OpenCV + PaddleOCR + Tesseract OCR extraction
-        ocr_result = OCRPipeline.process_image(image_bytes)
+        ocr_pipeline = getattr(scan_image_endpoint, "pipeline", None)
+        if not ocr_pipeline:
+            scan_image_endpoint.pipeline = OCRPipeline()
+            ocr_pipeline = scan_image_endpoint.pipeline
+            
+        ocr_result = ocr_pipeline.process_image(image_bytes)
         extracted_ocr_text = ocr_result["clean_text"]
         
         if not extracted_ocr_text.strip():
