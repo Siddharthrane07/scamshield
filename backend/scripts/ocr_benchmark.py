@@ -6,6 +6,10 @@ import argparse
 import numpy as np
 from pathlib import Path
 from collections import defaultdict
+from urllib.parse import urlparse
+
+if sys.platform == "win32":
+    sys.stdout.reconfigure(encoding='utf-8', errors='replace')
 
 # Add backend directory to sys.path to allow imports
 backend_dir = Path(__file__).resolve().parent.parent
@@ -47,6 +51,29 @@ def compute_wer(reference, hypothesis):
         return 0.0 if len(hyp_words) == 0 else 1.0
     dist = levenshtein_distance(ref_words, hyp_words)
     return dist / ref_len
+
+def log_url_failures(image_name, ground_truth_urls, extracted_urls, ocr_clean_text):
+    for gt_url in ground_truth_urls:
+        if gt_url not in extracted_urls:
+            # Extract domain
+            domain = ""
+            try:
+                parse_url = gt_url if "://" in gt_url else "http://" + gt_url
+                parsed = urlparse(parse_url)
+                domain = parsed.netloc
+            except:
+                domain = gt_url
+                
+            domain_fragment = domain[:8]
+            is_present = domain_fragment.lower() in ocr_clean_text.lower()
+            
+            snippet = ocr_clean_text[:250].replace('\n', ' ')
+            print(f"[URL FAIL] {image_name}")
+            print(f"  Expected  : {gt_url}")
+            print(f"  Extracted : {extracted_urls}")
+            print(f"  Domain fragment present: {is_present}")
+            print(f"  Relevant OCR snippet   : {snippet}")
+
 
 def evaluate_entity_preservation(extracted_entities, expected_entities):
     """
@@ -118,6 +145,13 @@ def process_directory(image_dir, ground_truth, pipeline):
                     record["expected_entities"] = expected_entities
                     record["extracted_entities"] = extracted_entities
                     record["entity_stats"] = evaluate_entity_preservation(extracted_entities, expected_entities)
+
+                    log_url_failures(
+                        image_path.name,
+                        expected_entities.get("urls", []),
+                        extracted_entities.get("urls", []),
+                        record["clean_text"]
+                    )
 
                 
                 results.append(record)
