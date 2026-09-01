@@ -40,3 +40,19 @@ Thumbs.db
 
 # OCR Diagnostic Reports
 *.json
+
+# Raw Data & Intermediate Dumps
+backend/data/raw/
+*.parquet
+*.csv
+*.zip
+*.tar.gz
+
+# Model Weights, Checkpoints & Caches (Phase 4 Guard)
+backend/models/
+*.pt
+*.bin
+*.safetensors
+runs/
+wandb/
+.cache/
