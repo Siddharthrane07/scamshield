@@ -42,14 +42,15 @@ Thumbs.db
 *.json
 
 # Raw Data & Intermediate Dumps
-backend/data/raw/
+data/raw/
 *.parquet
 *.csv
 *.zip
 *.tar.gz
 
 # Model Weights, Checkpoints & Caches (Phase 4 Guard)
-backend/models/
+models/
+model_checkpoints/
 *.pt
 *.bin
 *.safetensors

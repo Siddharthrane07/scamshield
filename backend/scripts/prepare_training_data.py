@@ -30,17 +30,20 @@ OTP_RE = re.compile(r'\b(?:otp|one time password|verification code|pin|passcode|
 UPI_RE = re.compile(r'\b[a-zA-Z0-9.\-_]+@[a-zA-Z]{2,}\b')
 AMOUNT_RE = re.compile(r'(?:INR|Rs\.?|₹|rs\.?|\$|£)\s*(\d+(?:,\d+)*(?:\.\d{1,2})?)', re.IGNORECASE)
 
-HINGLISH_WORDS = {
+STRONG_INDIC_WORDS = {
     'aapka', 'aapke', 'aapko', 'apna', 'apne', 'apni', 'karein', 'kare', 'karo', 'karna',
-    'turant', 'hai', 'hain', 'ho', 'gaya', 'gayi', 'gaye', 'nahi', 'nahin', 'mat',
-    'bheja', 'bheje', 'bhejo', 'khata', 'khate', 'inaam', 'badhai', 'paise', 'paisa', 'rupaye', 'rupay',
-    'rha', 'rhi', 'rahe', 'raha', 'rahi', 'mujhe', 'mera', 'meri', 'mere', 'tera', 'teri',
-    'tere', 'humare', 'humara', 'varna', 'warna', 'band', 'kripya', 'dhanyawad',
-    'chahiye', 'wala', 'wali', 'wale', 'hoga', 'hogi', 'hoge', 'liye', 'baat', 'karta',
-    'karti', 'karte', 'pata', 'chalega', 'bhai', 'beta', 'papa', 'sahab',
-    'sarkari', 'suchna', 'adhikari', 'sambandhit', 'suvidha', 'shulk', 'jama', 'bhugtan',
-    'kijiye', 'krwalo', 'kro', 'sir', 'madam', 'jaldi', 'dekh', 'lo', 'kardo', 'diya',
-    'challan', 'bijli', 'parivahan', 'dhokhadhadi', 'mubarak', 'police', 'yojana'
+    'kijiye', 'krwalo', 'kardo', 'turant', 'dhokhadhadi', 'bijli', 'challan', 'parivahan',
+    'khata', 'khate', 'inaam', 'badhai', 'paise', 'paisa', 'rupaye', 'rupay', 'dhanyawad',
+    'chahiye', 'chalega', 'adhikari', 'sambandhit', 'suvidha', 'bhugtan', 'mubarak',
+    'yojana', 'sarkari', 'suchna', 'warna', 'varna', 'kripya', 'sahab', 'shulk', 'jama',
+    'paayein', 'sampark', 'jaldi'
+}
+
+INDIC_GRAMMAR_PARTICLES = {
+    'hai', 'hain', 'hoga', 'hogi', 'hoge', 'gaya', 'gayi', 'gaye', 'nahi', 'nahin', 'mat',
+    'bheja', 'bheje', 'bhejo', 'raha', 'rahe', 'rahi', 'rha', 'rhi', 'mujhe', 'mera', 'meri',
+    'mere', 'tera', 'teri', 'tere', 'humara', 'humare', 'bhai', 'beta', 'papa', 'pata',
+    'baat', 'karta', 'karti', 'karte', 'liye', 'wala', 'wali', 'wale', 'hua', 'hui', 'hue'
 }
 
 def redact_aadhaar(text: str) -> str:
@@ -50,15 +53,21 @@ def detect_language(text: str) -> str:
     if bool(DEVANAGARI_RE.search(text)):
         return "Hindi"
     
-    tokens = [w.lower().strip(".,!?:;\"'()[]{}<>-/\\#@$%^&*~`") for w in text.split()]
+    tokens = set(w.lower().strip(".,!?:;\"'()[]{}<>-/\\#@$%^&*~`") for w in text.split())
     if not tokens:
         return "English"
     
-    hinglish_matches = sum(1 for t in tokens if t in HINGLISH_WORDS)
-    ratio = hinglish_matches / len(tokens)
+    strong_hits = tokens & STRONG_INDIC_WORDS
+    grammar_hits = tokens & INDIC_GRAMMAR_PARTICLES
     
-    if hinglish_matches >= 2 or ratio >= 0.05 or any(k in tokens for k in ['aapka', 'karein', 'turant', 'khata', 'dhokhadhadi', 'bijli', 'challan']):
+    # Rule 1: At least 1 strong unambiguous Indic keyword
+    if len(strong_hits) >= 1:
         return "Hinglish"
+    
+    # Rule 2: At least 2 distinct Indic grammatical particles
+    if len(grammar_hits) >= 2:
+        return "Hinglish"
+        
     return "English"
 
 def extract_social_engineering_tags(text: str, is_scam: int) -> dict:
@@ -244,6 +253,18 @@ if gt_path.exists():
             is_scam = 1 if any(k in text_lower for k in ['scam', 'block', 'kyc', 'inaam', 'lottery', 'winner', 'loan', 'virus', 'apk', 'customs', 'duty']) else 0
             add_real_record(text, is_scam, "Benchmark_Ground_Truth")
     print(f"Loaded Real Benchmark Ground Truth. Cumulative real records: {len(real_records)}")
+
+# 6. Ingest Kaggle Hindi Cleaned Data (Devanagari Hindi Ham & Scam)
+kaggle_hindi_path = raw_dir / "kaggle_hindi_clean.jsonl"
+if kaggle_hindi_path.exists():
+    with open(kaggle_hindi_path, "r", encoding="utf-8") as f:
+        for line in f:
+            line_str = line.strip()
+            if line_str:
+                data = json.loads(line_str)
+                add_real_record(data["text"], data["is_scam"], data.get("source_dataset", "Kaggle_Hindi_Merged"))
+    print(f"Loaded Kaggle Hindi Cleaned Data. Cumulative real records: {len(real_records)}")
+
 
 # ==========================================
 # 2. STRATIFIED SPLITTING (REAL DATA ONLY)
