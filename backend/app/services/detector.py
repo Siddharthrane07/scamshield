@@ -2,6 +2,7 @@ import re
 import logging
 from typing import Dict, Any, List
 from app.core.exceptions import MarathiLanguageException
+from app.services.ocr.ocr_postprocess import fix_split_urls, extract_entities, extract_urls
 
 logger = logging.getLogger("scamshield.detector")
 
@@ -38,11 +39,15 @@ class DetectorService:
     @classmethod
     def clean_text(cls, text: str) -> str:
         """
-        Cleans and normalizes text: strips trailing/leading whitespaces,
-        normalizes multiple spaces to single space, and checks Marathi exclusion.
+        Cleans and normalizes text: checks Marathi exclusion,
+        stitches broken/wrapped URLs, strips trailing/leading whitespaces,
+        and normalizes multiple spaces to single space.
         """
         # Intercept and block Marathi immediately
         cls.check_marathi_exclusion(text)
+        
+        # Stitch any URLs split across newlines or spaces before flattening whitespace
+        text = fix_split_urls(text)
         
         # Strip trailing/leading spaces
         text = text.strip()
@@ -54,43 +59,38 @@ class DetectorService:
     @classmethod
     def extract_entities(cls, text: str) -> Dict[str, List[str]]:
         """
-        Extracts structured arrays: URLs, Phone numbers, and UPI IDs using regex.
+        Extracts structured arrays: URLs, Phone numbers, and UPI IDs.
         """
-        # Regex Patterns
-        # URLs beginning with http/https
-        url_pattern = re.compile(
-            r'https?://(?:www\.)?[-a-zA-Z0-9@:%._\+~#=]{1,256}\.[a-zA-Z0-9()]{1,6}\b(?:[-a-zA-Z0-9()@:%_\+.~#?&//=]*)',
-            re.IGNORECASE
-        )
-        
-        # Indian phone numbers: +91, 91, 0 prefix, followed by 10 digits starting with 6-9
-        phone_pattern = re.compile(r'\b(?:\+91|91|0)?[6-9]\d{9}\b')
-        
-        # UPI IDs: standard format username@bank (commonly 2 or more characters for VPA handle)
-        upi_pattern = re.compile(r'\b[a-zA-Z0-9.\-_]+@[a-zA-Z]{2,}\b')
-
-        urls = list(set(url_pattern.findall(text)))
-        phones = list(set(phone_pattern.findall(text)))
-        upis = list(set(upi_pattern.findall(text)))
-
+        ent = extract_entities(text)
         return {
-            "urls": urls,
-            "phones": phones,
-            "upis": upis
+            "urls": ent.get("urls", []),
+            "phones": ent.get("phone_numbers", []),
+            "upis": ent.get("upi_ids", [])
         }
 
     @classmethod
     def process(cls, text: str) -> Dict[str, Any]:
         """
-        Runs the full detoxification, normalization, and entity extraction pipeline.
+        Runs the full detoxification, URL healing, normalization, and entity extraction pipeline.
         Returns a clean JSON metadata packet.
         """
-        normalized_text = cls.clean_text(text)
-        entities = cls.extract_entities(normalized_text)
+        cls.check_marathi_exclusion(text)
+        
+        # 1. Heal URLs while line breaks and hyphens are intact
+        stitched_text = fix_split_urls(text)
+        
+        # 2. Extract full structured entities
+        entities = extract_entities(stitched_text)
+        
+        # 3. Normalize whitespace for ML text input
+        normalized_text = re.sub(r'\s+', ' ', stitched_text).strip()
         
         return {
             "normalized_text": normalized_text,
-            "urls": entities["urls"],
-            "phones": entities["phones"],
-            "upis": entities["upis"]
+            "urls": entities.get("urls", []),
+            "domains": entities.get("domains", []),
+            "phones": entities.get("phone_numbers", []),
+            "upis": entities.get("upi_ids", []),
+            "entities": entities
         }
+

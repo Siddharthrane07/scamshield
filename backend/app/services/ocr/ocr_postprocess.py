@@ -1,8 +1,8 @@
 import re
-from typing import Dict, List, Tuple
+from typing import Dict, List, Tuple, Any
 from urllib.parse import urlparse
 
-VALID_TLDS = r'(?:com|org|net|in|gov|edu|xyz|co|io|ly|me|top|site|live|info|biz|online|app|page|ke|ng|ai|ph)'
+VALID_TLDS = r'(?:com|org|net|in|gov|edu|xyz|co|io|ly|me|top|site|live|info|biz|online|app|page|ke|ng|ai|ph|cc|club|shop|store|vip|pro|icu)'
 URL_PATTERN = re.compile(
     rf'https?://[^\s,;!?"\'\)\]}}]+|www\.[^\s,;!?"\'\)\]}}]+|[a-zA-Z0-9\-]+\.{VALID_TLDS}(?:/[^\s,;!?"\'\)\]}}]*)?',
     re.IGNORECASE
@@ -13,6 +13,9 @@ def sanitize_url_token(url: str) -> str:
     url = url.replace("https:II", "https://")
     url = url.replace("http:II", "http://")
     url = url.replace("https:l/", "https://")
+    url = url.replace("http:l/", "http://")
+    url = url.replace("https:1/", "https://")
+    url = url.replace("http:1/", "http://")
     url = url.replace("https:// ", "https://")
     url = url.replace("http:// ", "http://")
     url = url.replace("bit.Iy", "bit.ly")
@@ -22,44 +25,70 @@ def sanitize_url_token(url: str) -> str:
 
 def _stitch_wrapped_urls(text: str) -> str:
     """
-    Merge URL fragments that OCR split across newlines due to line-wrapping.
-
-    Patterns handled:
-      1. Line ends with 'https://<fragment>-'  -> next line is the continuation
-         e.g.  'https://secure.hsbc-uk-\nlogin.net/...' -> joined without newline
-      2. Line ends with a URL path fragment ending in '-' or '/'
-         e.g.  'login.net/verify-pass-otp-\nnow.html' -> joined
-      3. A line that starts mid-URL (no protocol, just domain-looking token)
-         immediately after a hyphen-terminated fragment.
-
-    Strategy: scan the reconstructed lines. If a line (after stripping trailing
-    spaces) ends with a hyphen AND the next line begins with a lowercase
-    alphanumeric token (likely a domain/path continuation), merge them by
-    removing the newline.  Repeat up to 5 times to handle deeply-wrapped URLs.
+    Robustly stitch URLs split across newlines or spaces.
+    Handles:
+    - Protocol followed by newline: 'https://\\nfoo.com' -> 'https://foo.com'
+    - Line ending with hyphen in domain/path: 'https://foo-\\nbar.com' -> 'https://foo-bar.com'
+    - Line ending with slash: 'example.com/\\npath' -> 'example.com/path'
+    - Path continuation across lines: 'example.com/path/aa\\ndharnow' -> 'example.com/path/aadharnow'
+    - Space inside URL caused by OCR: 'https:// govt-schemes-drop- india- official.net/...'
     """
-    # Pattern: a line ending in a hyphen (URL fragment), the very next line
-    # starts with a letter/digit (continuation of domain or path).
-    # We only merge when the line before the hyphen looks URL-related
-    # (contains 'http', 'www', or at least one dot, or already has a slash).
-    url_frag_re = re.compile(
-        r'((?:https?://|www\.)[^\n]*?[a-zA-Z0-9\-/]+-)'   # line with http/www prefix ending in -
-        r'\n'
-        r'([a-zA-Z0-9][^\n]*)',                             # continuation line
-        re.IGNORECASE
-    )
-    # Also merge plain fragment-to-fragment: domain-partial- \n path-or-domain
-    plain_frag_re = re.compile(
-        r'([a-zA-Z0-9][a-zA-Z0-9\-\.]*[a-zA-Z0-9\-/]+-)'  # any token ending in -
-        r'\n'
-        r'([a-zA-Z0-9][a-zA-Z0-9\-\./_]*)',                 # continuation
-        re.IGNORECASE
-    )
+    # Step 1: Protocol followed by newline or space
+    text = re.sub(r'(https?://|www\.)[ \t]*\n[ \t]*', r'\1', text)
+    text = re.sub(r'(https?://)[ \t]+', r'\1', text)
+    text = re.sub(r'(www\.)[ \t]+', r'\1', text)
+
+    # Step 2: Line ending with hyphen or path fragment after URL start
     for _ in range(5):
-        prev = text
-        text = url_frag_re.sub(r'\1\2', text)
-        text = plain_frag_re.sub(r'\1\2', text)
-        if text == prev:
+        # 2a. Line starts or contains URL prefix and ends with hyphen -> merge next line directly
+        new_text = re.sub(
+            r'((?:https?://|www\.)[^\n]*?[\w\-/]+-)[ \t]*\n[ \t]*([a-zA-Z0-9])',
+            r'\1\2',
+            text,
+            flags=re.IGNORECASE
+        )
+        # 2b. Continuation line from previous hyphen-split that ends in hyphen -> merge next line
+        new_text = re.sub(
+            r'([a-zA-Z0-9\-_./]+-)[ \t]*\n[ \t]*([a-zA-Z0-9])',
+            r'\1\2',
+            new_text,
+            flags=re.IGNORECASE
+        )
+        # 2c. Line containing URL with path ending in slash or word fragment before newline,
+        # where next line starts with lowercase/digit path continuation (e.g. .net/renewal/pandigital/aa\ndharnow)
+        new_text = re.sub(
+            r'((?:https?://|www\.)[^\n\s]*?/[^\n\s]*?[a-zA-Z0-9])[ \t]*\n[ \t]*([a-zA-Z0-9_\-./]+\.[a-zA-Z0-9]+|[a-zA-Z0-9_\-/]+(?:\s|$))',
+            r'\1\2',
+            new_text,
+            flags=re.IGNORECASE
+        )
+        if new_text == text:
             break
+        text = new_text
+
+    # Step 3: Space around hyphens in domain/URL on same line (e.g. 'govt- schemes- drop- india- official.net')
+    for _ in range(5):
+        new_text = re.sub(
+            r'((?:https?://|www\.)[^\s]*?[\w\-]+-)[ \t]+([\w\-]+)',
+            r'\1\2',
+            text,
+            flags=re.IGNORECASE
+        )
+        new_text = re.sub(
+            r'([\w\-]+-)[ \t]+([\w\-]+(?:\.[\w\-]+|/))',
+            r'\1\2',
+            new_text,
+            flags=re.IGNORECASE
+        )
+        if new_text == text:
+            break
+        text = new_text
+
+    # Step 4: Space around slashes in URL paths
+    text = re.sub(r'(/[a-zA-Z0-9\-_]+)[ \t]+(/[a-zA-Z0-9\-_]+)', r'\1\2', text)
+    text = re.sub(r'([a-zA-Z0-9\-]+\.[a-zA-Z]{2,}/)[ \t]+([a-zA-Z0-9\-_]+)', r'\1\2', text)
+    text = re.sub(r'/[ \t]+([a-zA-Z0-9\-_]+)', r'/\1', text)
+
     return text
 
 def fix_split_urls(text: str) -> str:
@@ -114,7 +143,15 @@ def extract_urls(clean_text: str) -> List[str]:
             
     return final_urls
 
-def extract_entities(clean_text: str) -> Dict[str, List[str]]:
+def extract_entities(clean_text: str) -> Dict[str, Any]:
+    """
+    Extracts structured entities from text: URLs, domains, UPI IDs,
+    phone numbers, OTP candidates, amounts, and bank names.
+    Also handles Aadhaar redaction.
+    """
+    # 0. Heal URLs in text
+    clean_text = fix_split_urls(clean_text)
+
     # Aadhaar Redaction
     aadhaar_pattern = re.compile(r'\b\d{4}\s\d{4}\s\d{4}\b')
     if aadhaar_pattern.search(clean_text):
@@ -143,7 +180,6 @@ def extract_entities(clean_text: str) -> Dict[str, List[str]]:
 
     # OTP Candidates (4-6 digits)
     otp_pattern = re.compile(r'\b\d{4,6}\b')
-    # Filter out phones or other known numbers
     all_numbers = otp_pattern.findall(clean_text)
     otp_candidates = [n for n in all_numbers if not any(n in p for p in phone_numbers)]
     otp_candidates = list(set(otp_candidates))
@@ -153,7 +189,7 @@ def extract_entities(clean_text: str) -> Dict[str, List[str]]:
     amounts = list(set(amount_pattern.findall(clean_text)))
 
     # Bank Names
-    bank_list = ["HDFC", "SBI", "ICICI", "AXIS", "KOTAK", "PAYTM", "RBI"]
+    bank_list = ["HDFC", "SBI", "ICICI", "AXIS", "KOTAK", "PAYTM", "RBI", "PNB", "BOB", "HSBC", "JIO", "AIRTEL"]
     bank_names = []
     text_upper = clean_text.upper()
     for bank in bank_list:
@@ -170,3 +206,4 @@ def extract_entities(clean_text: str) -> Dict[str, List[str]]:
         "bank_names": bank_names,
         "redacted_text": clean_text
     }
+

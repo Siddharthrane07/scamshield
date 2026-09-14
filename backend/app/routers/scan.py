@@ -113,14 +113,11 @@ async def scan_text_endpoint(
     and returns localized safety reports.
     """
     try:
-        # Preprocess text and enforce Marathi exclusion
-        normalized_input = DetectorService.clean_text(payload.text)
-        
         # Execute Pipeline
         return await execute_scan_pipeline(
             raw_input=payload.text,
             input_type="text",
-            extracted_text=normalized_input,
+            extracted_text=payload.text,
             db=db
         )
     except MarathiLanguageException as mle:
@@ -150,13 +147,13 @@ async def scan_image_endpoint(
 ):
     """
     Ingests mobile screenshots, pre-processes image using OpenCV,
-    performs Tesseract OCR, normalizes extracted text, and runs threat intelligence.
+    performs PaddleOCR, normalizes extracted text, and runs threat intelligence.
     """
     try:
         # Read uploaded image bytes
         image_bytes = await file.read()
         
-        # Layer 2: OpenCV + PaddleOCR + Tesseract OCR extraction
+        # Layer 2: OpenCV + PaddleOCR extraction
         ocr_pipeline = getattr(scan_image_endpoint, "pipeline", None)
         if not ocr_pipeline:
             scan_image_endpoint.pipeline = OCRPipeline()
@@ -170,15 +167,12 @@ async def scan_image_endpoint(
                 status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
                 detail="OCR failed to extract any readable text from the uploaded screenshot."
             )
-            
-        # Clean and run Marathi check
-        normalized_ocr_text = DetectorService.clean_text(extracted_ocr_text)
 
         # Execute Pipeline
         return await execute_scan_pipeline(
             raw_input=file.filename,
             input_type="image",
-            extracted_text=normalized_ocr_text,
+            extracted_text=extracted_ocr_text,
             db=db
         )
     except MarathiLanguageException as mle:

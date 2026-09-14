@@ -9,9 +9,11 @@ logger = logging.getLogger("scamshield.track_a")
 settings = get_settings()
 
 TRUSTED_BRANDS = [
-    "sbi", "hdfc", "icici", "paytm", "amazon", "flipkart", 
-    "netflix", "google", "microsoft", "apple", "paypal", 
-    "phonepe", "onlinesbi", "bhim", "yono"
+    "sbi", "hdfc", "icici", "axis", "kotak", "pnb", "bob", "hsbc",
+    "paytm", "phonepe", "bhim", "gpay", "paypal", "yono", "onlinesbi",
+    "jio", "airtel", "vi", "bsnl", "vodafone",
+    "amazon", "flipkart", "netflix", "google", "microsoft", "apple",
+    "uidai", "pan", "incometax", "epfo", "indiapost"
 ]
 
 HOMOGLYPH_MAP = {
