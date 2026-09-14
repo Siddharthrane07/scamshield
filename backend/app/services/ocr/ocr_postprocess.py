@@ -20,23 +20,68 @@ def sanitize_url_token(url: str) -> str:
     url = url.replace("bit.lyI", "bit.ly/")
     return url
 
+def _stitch_wrapped_urls(text: str) -> str:
+    """
+    Merge URL fragments that OCR split across newlines due to line-wrapping.
+
+    Patterns handled:
+      1. Line ends with 'https://<fragment>-'  -> next line is the continuation
+         e.g.  'https://secure.hsbc-uk-\nlogin.net/...' -> joined without newline
+      2. Line ends with a URL path fragment ending in '-' or '/'
+         e.g.  'login.net/verify-pass-otp-\nnow.html' -> joined
+      3. A line that starts mid-URL (no protocol, just domain-looking token)
+         immediately after a hyphen-terminated fragment.
+
+    Strategy: scan the reconstructed lines. If a line (after stripping trailing
+    spaces) ends with a hyphen AND the next line begins with a lowercase
+    alphanumeric token (likely a domain/path continuation), merge them by
+    removing the newline.  Repeat up to 5 times to handle deeply-wrapped URLs.
+    """
+    # Pattern: a line ending in a hyphen (URL fragment), the very next line
+    # starts with a letter/digit (continuation of domain or path).
+    # We only merge when the line before the hyphen looks URL-related
+    # (contains 'http', 'www', or at least one dot, or already has a slash).
+    url_frag_re = re.compile(
+        r'((?:https?://|www\.)[^\n]*?[a-zA-Z0-9\-/]+-)'   # line with http/www prefix ending in -
+        r'\n'
+        r'([a-zA-Z0-9][^\n]*)',                             # continuation line
+        re.IGNORECASE
+    )
+    # Also merge plain fragment-to-fragment: domain-partial- \n path-or-domain
+    plain_frag_re = re.compile(
+        r'([a-zA-Z0-9][a-zA-Z0-9\-\.]*[a-zA-Z0-9\-/]+-)'  # any token ending in -
+        r'\n'
+        r'([a-zA-Z0-9][a-zA-Z0-9\-\./_]*)',                 # continuation
+        re.IGNORECASE
+    )
+    for _ in range(5):
+        prev = text
+        text = url_frag_re.sub(r'\1\2', text)
+        text = plain_frag_re.sub(r'\1\2', text)
+        if text == prev:
+            break
+    return text
+
 def fix_split_urls(text: str) -> str:
     """
     Heals split URL tokens caused by OCR space/hyphen fragmentation
     without touching regular English/Hindi sentences or crossing newlines.
     """
-    # 0. Fix missing space after colon: Click:bit.ly -> Click: bit.ly
+    # 0. Stitch URLs that were line-wrapped across newlines in the source image
+    text = _stitch_wrapped_urls(text)
+
+    # 1. Fix missing space after colon: Click:bit.ly -> Click: bit.ly
     text = re.sub(r':(?=[a-zA-Z0-9\-]+\.[a-zA-Z]{2,})', ': ', text)
 
-    # 1. Fix space after protocol: https:// google.com -> https://google.com
+    # 2. Fix space after protocol: https:// google.com -> https://google.com
     text = re.sub(r'(https?://)[ \t]+', r'\1', text)
     text = re.sub(r'(www\.)[ \t]+', r'\1', text)
     
-    # 2. Fix space around slashes in URLs (on same line only): bit.ly/ Safaricomapp -> bit.ly/Safaricomapp
+    # 3. Fix space around slashes in URLs (on same line only): bit.ly/ Safaricomapp -> bit.ly/Safaricomapp
     text = re.sub(r'([a-zA-Z0-9\-]+\.[a-zA-Z]{2,}/)[ \t]+([a-zA-Z0-9\-_]+)', r'\1\2', text)
     text = re.sub(r'/[ \t]+([a-zA-Z0-9\-_]+)', r'/\1', text)
     
-    # 3. Fix space around hyphens in domain names (allowing multi-hyphen prefixes):
+    # 4. Fix space around hyphens in domain names (allowing multi-hyphen prefixes):
     # e.g., kbc-lottery-winner- claim.net -> kbc-lottery-winner-claim.net
     for _ in range(3):
         text = re.sub(r'([a-zA-Z0-9\-]+-)[ \t]+([a-zA-Z0-9\-]+(?:\.[a-zA-Z]{2,}))', r'\1\2', text)
