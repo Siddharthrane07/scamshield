@@ -130,9 +130,9 @@ class ExplanationEngine:
             
         # 4. Domain & SSL Indicators (Track B)
         domains_analyzed = track_b.get("domains_analyzed", [])
-        recent_domain_detected = any(d.get("whois", {}).get("is_recent_domain") for d in domains_analyzed)
-        free_ssl_detected = any(d.get("ssl", {}).get("is_free_ssl") for d in domains_analyzed)
-        invalid_ssl_detected = any(not d.get("ssl", {}).get("ssl_valid") for d in domains_analyzed)
+        recent_domain_detected = any(d.get("whois", {}).get("is_recent_domain") is True for d in domains_analyzed)
+        free_ssl_detected = any(d.get("ssl", {}).get("is_free_ssl") is True and d.get("whois", {}).get("is_recent_domain") is True for d in domains_analyzed)
+        invalid_ssl_detected = any(d.get("ssl", {}).get("status") in ["invalid", "expired", "hostname_mismatch", "self_signed"] for d in domains_analyzed)
         
         if recent_domain_detected:
             bullets_en.append(TEMPLATES_EN["recent_domain"])

@@ -46,16 +46,33 @@ class TrackAURLIntel:
     @staticmethod
     def extract_domain(url: str) -> str:
         """
-        Helper to extract clean hostname/domain from a URL.
+        Helper to extract clean canonical hostname from a URL.
+        Normalizes:
+        - lowercase
+        - strips leading/trailing whitespace
+        - adds scheme if missing for proper urlparse
+        - removes userinfo credentials (user:pass@)
+        - removes port (:8080)
+        - removes trailing dot (example.com.)
+        - strips leading 'www.' prefix
+        - strips paths, query params, fragments
         """
+        if not url or not isinstance(url, str):
+            return ""
+        clean = url.strip()
+        if not clean:
+            return ""
+        # Ensure scheme for urlparse
+        import re
+        if not re.match(r'^[a-zA-Z][a-zA-Z0-9+\-.]*://', clean):
+            clean = "http://" + clean
         try:
-            parsed = urllib.parse.urlparse(url)
-            netloc = parsed.netloc or parsed.path
-            # Remove port if any
-            domain = netloc.split(":")[0].lower()
-            if domain.startswith("www."):
-                domain = domain[4:]
-            return domain
+            parsed = urllib.parse.urlparse(clean)
+            hostname = (parsed.hostname or "").lower().strip()
+            hostname = hostname.rstrip(".")
+            if hostname.startswith("www."):
+                hostname = hostname[4:]
+            return hostname
         except Exception:
             return url.lower()
 
