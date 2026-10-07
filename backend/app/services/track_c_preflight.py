@@ -39,10 +39,26 @@ class URLPreflightValidator:
     
     ALLOWED_SCHEMES = {"http", "https"}
 
+    _BLOCKED_NETWORKS = [
+        ipaddress.ip_network("100.64.0.0/10"),   # CGNAT
+        ipaddress.ip_network("192.0.0.0/24"),    # IETF Protocol Assignments
+        ipaddress.ip_network("198.18.0.0/15"),   # Benchmarking
+        ipaddress.ip_network("198.51.100.0/24"), # Documentation (TEST-NET-2)
+        ipaddress.ip_network("203.0.113.0/24"),  # Documentation (TEST-NET-3)
+        ipaddress.ip_network("240.0.0.0/4"),     # Reserved
+        ipaddress.ip_network("100::/64"),        # Discard (IPv6)
+        ipaddress.ip_network("2001:db8::/32"),   # Documentation (IPv6)
+    ]
+
     @classmethod
     def _is_ip_safe(cls, ip_str: str) -> bool:
         try:
             ip = ipaddress.ip_address(ip_str)
+            
+            # Unwrap IPv4-mapped IPv6 (e.g. ::ffff:10.0.0.1) to check the embedded IPv4 address
+            if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped is not None:
+                ip = ip.ipv4_mapped
+                
             # Check for various unsafe network ranges
             if ip.is_loopback:
                 return False
@@ -56,6 +72,12 @@ class URLPreflightValidator:
                 return False
             if ip.is_reserved:
                 return False
+                
+            # Check explicit blocked networks
+            for network in cls._BLOCKED_NETWORKS:
+                if ip in network:
+                    return False
+                    
             # Explicitly check for AWS Metadata IP
             if str(ip) == "169.254.169.254":
                 return False
@@ -89,13 +111,14 @@ class URLPreflightValidator:
         if not hostname:
             return PreflightResult(False, "Missing hostname in URL").to_dict()
 
-        hostname = hostname.lower()
-
-        if hostname == "localhost":
-            return PreflightResult(False, "Localhost hostname is not allowed").to_dict()
+        hostname = hostname.lower().rstrip(".")
 
         # Reconstruct normalized URL for safe downstream consumption
-        port_str = f":{parsed.port}" if parsed.port else ""
+        try:
+            port_str = f":{parsed.port}" if parsed.port else ""
+        except ValueError:
+            return PreflightResult(False, "Malformed port in URL").to_dict()
+            
         normalized_url = f"{scheme}://{hostname}{port_str}{parsed.path}"
         if parsed.query:
             normalized_url += f"?{parsed.query}"
