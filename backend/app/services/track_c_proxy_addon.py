@@ -1,6 +1,7 @@
 import socket
 import asyncio
 import logging
+import ipaddress
 from app.services.track_c_preflight import URLPreflightValidator
 
 logger = logging.getLogger("scamshield.track_c.proxy")
@@ -9,6 +10,12 @@ class ProxySecurityAddon:
     """
     Mitmproxy addon to enforce IP blocking policy at connection time.
     """
+
+    def tls_clienthello(self, data):
+        """
+        Force mitmproxy to pass TLS through blindly without decrypting.
+        """
+        data.ignore_connection = True
 
     async def server_connect(self, data):
         """
@@ -75,14 +82,26 @@ class ProxySecurityAddon:
             data.server.error = "Connection established but peername is missing"
             return
 
-        peer_ip = peername[0]
-        pinned_ip = data.server.address[0]
+        peer_ip_str = peername[0]
+        pinned_ip_str = data.server.address[0]
 
-        if peer_ip != pinned_ip:
-            data.server.error = f"Security bypass detected: connected to {peer_ip} instead of pinned IP {pinned_ip}"
+        try:
+            peer_ip = ipaddress.ip_address(peer_ip_str)
+            pinned_ip = ipaddress.ip_address(pinned_ip_str)
+            
+            if isinstance(peer_ip, ipaddress.IPv6Address) and peer_ip.ipv4_mapped is not None:
+                peer_ip = peer_ip.ipv4_mapped
+            if isinstance(pinned_ip, ipaddress.IPv6Address) and pinned_ip.ipv4_mapped is not None:
+                pinned_ip = pinned_ip.ipv4_mapped
+
+            if peer_ip != pinned_ip:
+                data.server.error = f"Security bypass detected: connected to {peer_ip_str} instead of pinned IP {pinned_ip_str}"
+                return
+        except ValueError:
+            data.server.error = "Invalid IP format in peername or address"
             return
 
-        if not URLPreflightValidator._is_ip_safe(peer_ip):
-            data.server.error = f"Connected to unsafe peer IP: {peer_ip}"
+        if not URLPreflightValidator._is_ip_safe(peer_ip_str):
+            data.server.error = f"Connected to unsafe peer IP: {peer_ip_str}"
 
 addons = [ProxySecurityAddon()]
