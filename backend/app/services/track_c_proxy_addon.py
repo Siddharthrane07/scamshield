@@ -20,6 +20,9 @@ class ProxySecurityAddon:
     async def server_connect(self, data):
         """
         Hook called by mitmproxy before establishing the upstream connection.
+        This hook is async because it awaits DNS resolution. Mitmproxy invokes
+        it before the upstream TCP socket is opened, which allows us to mutate
+        data.server.address to pin the validated IP before any connection is made.
         """
         if not getattr(data, "server", None) or not getattr(data.server, "address", None):
             if hasattr(data, "server") and data.server is not None:
@@ -30,8 +33,11 @@ class ProxySecurityAddon:
 
         loop = asyncio.get_running_loop()
         try:
+            # Use None for port so getaddrinfo returns all address records
+            # without filtering by service. The destination port is used only
+            # when setting the pinned upstream address below.
             addr_info = await asyncio.wait_for(
-                loop.getaddrinfo(host, port),
+                loop.getaddrinfo(host, None),
                 timeout=5.0
             )
         except asyncio.TimeoutError:
@@ -70,6 +76,8 @@ class ProxySecurityAddon:
     def server_connected(self, data):
         """
         Hook called by mitmproxy after the upstream connection is established.
+        This hook is synchronous because it performs no asynchronous work;
+        it only inspects the already-resolved peername attribute.
         """
         if not getattr(data, "server", None):
             return
@@ -101,7 +109,10 @@ class ProxySecurityAddon:
             data.server.error = "Invalid IP format in peername or address"
             return
 
-        if not URLPreflightValidator._is_ip_safe(peer_ip_str):
+        # Use the already-normalized, IPv4-mapped-unwrapped object for the
+        # safety check so the result is consistent with the comparison above.
+        # str() is used only because _is_ip_safe accepts a string argument.
+        if not URLPreflightValidator._is_ip_safe(str(peer_ip)):
             data.server.error = f"Connected to unsafe peer IP: {peer_ip_str}"
 
 addons = [ProxySecurityAddon()]
