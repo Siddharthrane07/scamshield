@@ -1,0 +1,12 @@
+# Integration test dependencies (dev only).
+# Do NOT add these to requirements.txt — they are not needed in production.
+# Install with: venv\Scripts\python.exe -m pip install -r requirements-integration.txt
+#
+# IMPORTANT: mitmproxy 10.x pins h11==0.14.0, which conflicts with
+# httpcore>=1.0.9 (used by httpx).  Both packages still function correctly
+# with h11==0.14.0 in practice, but pip will warn about the conflict.
+# The conflict is resolved by keeping the two in separate venvs for
+# production vs. integration testing in a future CI split.
+mitmproxy>=10.4,<11
+cryptography>=41.0
+requests>=2.31

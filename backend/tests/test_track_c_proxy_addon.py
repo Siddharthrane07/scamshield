@@ -103,6 +103,12 @@ class TestTrackCProxyAddon(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(data.server.address[1], 443)
         self.assertIn("93.184.216.34", data.server.address[0])
 
+        # Uppercase mapped notation — must also be PERMITTED and pinned
+        data_upper = await self._run_server_connect("example.com", 443, ["::FFFF:93.184.216.34"])
+        self.assertIsNone(data_upper.server.error)
+        self.assertEqual(data_upper.server.address[1], 443)
+        self.assertIn("93.184.216.34", data_upper.server.address[0])
+
     async def test_06_mixed_dns_results(self):
         data = await self._run_server_connect("example.com", 80, ["93.184.216.34", "10.0.0.1"])
         self.assertIsNotNone(data.server.error)
