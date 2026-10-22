@@ -118,8 +118,81 @@ def generate_test_certs(
     _write_cert(srv_cert, srv_cert_path)
     _write_key(srv_key, srv_key_path)
 
+    ca_spki_hash = compute_spki_hash(ca_cert)
+    server_spki_hash = compute_spki_hash(srv_cert)
+
     return {
         "ca_cert_path": ca_cert_path,
         "server_cert_path": srv_cert_path,
         "server_key_path": srv_key_path,
+        "ca_spki_hash": ca_spki_hash,
+        "server_spki_hash": server_spki_hash,
+    }
+
+
+def compute_spki_hash(cert_or_path) -> str:
+    """
+    Compute the base64-encoded SHA-256 fingerprint of the SubjectPublicKeyInfo (SPKI).
+    This matches the exact format expected by Chromium's
+    --ignore-certificate-errors-spki-list=<hash> flag.
+    """
+    import base64
+    import hashlib
+
+    if isinstance(cert_or_path, (str, pathlib.Path)):
+        cert_bytes = pathlib.Path(cert_or_path).read_bytes()
+        cert = x509.load_pem_x509_certificate(cert_bytes)
+        pubkey = cert.public_key()
+    elif isinstance(cert_or_path, x509.Certificate):
+        pubkey = cert_or_path.public_key()
+    else:
+        pubkey = cert_or_path
+
+    der = pubkey.public_bytes(
+        encoding=serialization.Encoding.DER,
+        format=serialization.PublicFormat.SubjectPublicKeyInfo,
+    )
+    return base64.b64encode(hashlib.sha256(der).digest()).decode("ascii")
+
+
+def generate_unrelated_certs(dest_dir: pathlib.Path, hostname: str = "unrelated.local") -> dict:
+    """
+    Generate an independent self-signed certificate whose public key is NOT
+    in the test CA's SPKI hash list. Used for the negative control test.
+    """
+    dest_dir = pathlib.Path(dest_dir)
+    dest_dir.mkdir(parents=True, exist_ok=True)
+
+    now = datetime.datetime.now(datetime.timezone.utc)
+    one_day = datetime.timedelta(days=1)
+
+    key = _rsa_key()
+    name = x509.Name([
+        x509.NameAttribute(NameOID.COMMON_NAME, hostname),
+    ])
+    san = x509.SubjectAlternativeName([
+        x509.DNSName(hostname),
+        x509.IPAddress(ipaddress.ip_address("127.0.0.1")),
+    ])
+    cert = (
+        x509.CertificateBuilder()
+        .subject_name(name)
+        .issuer_name(name)
+        .public_key(key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(now - one_day)
+        .not_valid_after(now + one_day)
+        .add_extension(san, critical=False)
+        .sign(key, hashes.SHA256())
+    )
+
+    cert_path = dest_dir / "unrelated_cert.pem"
+    key_path = dest_dir / "unrelated_key.pem"
+    _write_cert(cert, cert_path)
+    _write_key(key, key_path)
+
+    return {
+        "cert_path": cert_path,
+        "key_path": key_path,
+        "spki_hash": compute_spki_hash(cert),
     }
