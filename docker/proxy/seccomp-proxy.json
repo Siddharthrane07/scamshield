@@ -1,0 +1,37 @@
+{
+  "defaultAction": "SCMP_ACT_ALLOW",
+  "architectures": [
+    "SCMP_ARCH_X86_64",
+    "SCMP_ARCH_X86",
+    "SCMP_ARCH_AARCH64"
+  ],
+  "syscalls": [
+    {
+      "names": [
+        "ptrace",
+        "process_vm_readv",
+        "process_vm_writev",
+        "perf_event_open",
+        "bpf",
+        "unshare",
+        "setns",
+        "mount",
+        "umount2",
+        "pivot_root",
+        "open_by_handle_at",
+        "io_uring_setup",
+        "io_uring_enter",
+        "io_uring_register",
+        "reboot",
+        "kexec_load",
+        "kexec_file_load",
+        "init_module",
+        "finit_module",
+        "delete_module"
+      ],
+      "action": "SCMP_ACT_ERRNO",
+      "args": [],
+      "comment": "Block kernel modification, namespace manipulation, cross-process memory access, and container escape vectors"
+    }
+  ]
+}
