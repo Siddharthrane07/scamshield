@@ -6,8 +6,13 @@ Validates that docker/proxy/entrypoint.sh adheres to fail-closed security invari
 2. Insufficient permissions (missing CAP_NET_ADMIN) exits nonzero (refuses to start).
 3. Any rule installation failure aborts immediately with nonzero exit code.
 4. Ruleset verification failure (rule missing or inactive) aborts before mitmdump.
-5. Successful firewall installation and verification proceeds to unprivileged execution.
-6. Missing proxy addon script exits nonzero (refuses to start).
+5. Strict rule ordering is enforced:
+   - Prohibited destination drops strictly precede stateful ESTABLISHED,RELATED acceptance.
+   - Intra-container loopback acceptance (-o lo -j ACCEPT) precedes external loopback drop (-d 127.0.0.0/8 -j DROP).
+   - External loopback drop precedes ESTABLISHED,RELATED acceptance.
+   - Default deny (-j DROP) is the final rule in the chain.
+6. Successful firewall installation and verification proceeds to unprivileged execution.
+7. Missing proxy addon script exits nonzero (refuses to start).
 
 All tests use isolated mock binaries in a synthetic PATH.
 Host firewalls are never altered and no public network access is required.
@@ -26,8 +31,7 @@ _REPO_ROOT = _BACKEND_DIR.parent
 _ENTRYPOINT_SCRIPT = _REPO_ROOT / "docker" / "proxy" / "entrypoint.sh"
 
 EXPECTED_RULES = [
-    "-o lo -j ACCEPT",
-    "-m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT",
+    # Phase 1: Prohibited destination drops (unconditional, precedes stateful acceptance)
     "-d 169.254.169.254/32 -j DROP",
     "-d 169.254.0.0/16 -j DROP",
     "-d 10.0.0.0/8 -j DROP",
@@ -38,12 +42,19 @@ EXPECTED_RULES = [
     "-d 198.51.100.0/24 -j DROP",
     "-d 203.0.113.0/24 -j DROP",
     "-d 240.0.0.0/4 -j DROP",
+    # Phase 2: Intra-container loopback interface communication
+    "-o lo -j ACCEPT",
+    # Phase 3: Prohibit loopback-addressed traffic on external interfaces
     "-d 127.0.0.0/8 -j DROP",
+    # Phase 4: Stateful return traffic acceptance (for permitted public destinations only)
+    "-m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT",
+    # Phase 5: Permitted outbound transport & port rules
     "-p udp --dport 53 -j ACCEPT",
     "-p tcp --dport 53 -j ACCEPT",
     "-p udp -j DROP",
     "-p tcp --dport 80 -j ACCEPT",
     "-p tcp --dport 443 -j ACCEPT",
+    # Phase 6: Default deny for all remaining outbound traffic
     "-j DROP",
 ]
 
@@ -124,9 +135,6 @@ class TestTrackCProxyEntrypointHardening(unittest.TestCase):
 
     def test_missing_iptables_fails_closed(self):
         """Proxy must exit nonzero if iptables binary is not in PATH."""
-        # Note: self.mock_bin_dir does NOT contain an iptables script.
-        # Ensure system PATH does not provide iptables by overriding PATH to only our mock dir
-        # plus standard posix paths (without iptables).
         result = self._run_entrypoint(env_overrides={"PATH": str(self.mock_bin_dir)})
 
         self.assertNotEqual(result.returncode, 0, "Entrypoint must exit nonzero when iptables is missing")
@@ -137,7 +145,6 @@ class TestTrackCProxyEntrypointHardening(unittest.TestCase):
 
     def test_insufficient_privileges_fails_closed(self):
         """Proxy must exit nonzero if iptables inspection fails (missing CAP_NET_ADMIN)."""
-        # Mock iptables returning 1 on permission check (-L OUTPUT -n)
         iptables_body = """
 echo "iptables $*" >> "${INVOCATIONS_LOG}"
 if [ "$1" = "-L" ] && [ "$2" = "OUTPUT" ] && [ "$3" = "-n" ]; then
@@ -155,21 +162,18 @@ exit 0
         self.assertIn("Insufficient permissions to inspect/modify iptables (CAP_NET_ADMIN missing)", output)
         self.assertFalse(self.mitm_log.exists(), "mitmdump must not be executed when permissions are insufficient")
 
-        # Verify no rule installation was attempted
         if self.log_file.exists():
             log_content = self.log_file.read_text(encoding="utf-8")
             self.assertNotIn("-A OUTPUT", log_content, "No rules should be installed if permission check fails")
 
     def test_rule_installation_failure_fails_closed(self):
         """Proxy must exit nonzero immediately if any required rule installation fails."""
-        # Mock iptables that succeeds on permission check, but fails on a specific rule
         iptables_body = """
 echo "iptables $*" >> "${INVOCATIONS_LOG}"
 if [ "$1" = "-L" ]; then
     exit 0
 fi
 if [ "$1" = "-A" ]; then
-    # Intentionally fail on the cloud metadata drop rule
     for arg in "$@"; do
         if [ "$arg" = "169.254.169.254/32" ]; then
             echo "iptables: Memory allocation error / Table locked" >&2
@@ -192,7 +196,6 @@ exit 0
 
     def test_verification_failure_fails_closed(self):
         """Proxy must exit nonzero if any required rule fails kernel verification (-C)."""
-        # Mock iptables where -L and -A succeed, but -C fails for RFC1918 10.0.0.0/8
         iptables_body = """
 echo "iptables $*" >> "${INVOCATIONS_LOG}"
 if [ "$1" = "-L" ] || [ "$1" = "-A" ]; then
@@ -219,23 +222,20 @@ exit 0
         self.assertIn("10.0.0.0/8", output)
         self.assertFalse(self.mitm_log.exists(), "mitmdump must not be executed on verification failure")
 
-    def test_successful_startup_prerequisites(self):
-        """When firewall rules are installed and verified, proxy completes startup prerequisites."""
-        # Mock iptables: succeeds on -L, -A, and -C
+    def test_successful_startup_prerequisites_and_exact_order(self):
+        """When firewall rules are installed and verified, proxy completes startup in exact security order."""
         iptables_body = """
 echo "iptables $*" >> "${INVOCATIONS_LOG}"
 exit 0
 """
         self._create_mock_script("iptables", iptables_body)
 
-        # Mock mitmdump: records call arguments to MITM_LOG and exits cleanly
         mitmdump_body = """
 echo "mitmdump $*" > "${MITM_LOG}"
 exit 0
 """
         self._create_mock_script("mitmdump", mitmdump_body)
 
-        # Mock gosu: executes the given command
         gosu_body = """
 shift
 exec "$@"
@@ -246,23 +246,112 @@ exec "$@"
 
         self.assertEqual(result.returncode, 0, f"Expected successful execution, got: {result.stderr}")
         output = result.stdout + result.stderr
-        self.assertIn("All 19 required firewall rules installed successfully.", output)
-        self.assertIn("Kernel firewall ruleset verified: all 19 required rules active.", output)
+        self.assertIn(f"All {len(EXPECTED_RULES)} required firewall rules installed successfully.", output)
+        self.assertIn(f"Kernel firewall ruleset verified: all {len(EXPECTED_RULES)} required rules active.", output)
 
-        # Verify that all 19 rules were actually installed and verified
-        log_content = self.log_file.read_text(encoding="utf-8")
-        for rule in EXPECTED_RULES:
-            expected_install = f"iptables -A OUTPUT {rule}"
-            expected_verify = f"iptables -C OUTPUT {rule}"
-            self.assertIn(expected_install, log_content, f"Missing install command: {expected_install}")
-            self.assertIn(expected_verify, log_content, f"Missing verify command: {expected_verify}")
+        log_lines = self.log_file.read_text(encoding="utf-8").splitlines()
 
-        # Verify mitmdump was launched with correct arguments
+        # Extract installed rules and verified rules in order of execution
+        installed_rules = [
+            line[len("iptables -A OUTPUT "):]
+            for line in log_lines
+            if line.startswith("iptables -A OUTPUT ")
+        ]
+        verified_rules = [
+            line[len("iptables -C OUTPUT "):]
+            for line in log_lines
+            if line.startswith("iptables -C OUTPUT ")
+        ]
+
+        self.assertEqual(installed_rules, EXPECTED_RULES, "Installed rules must match EXPECTED_RULES exactly in sequence")
+        self.assertEqual(verified_rules, EXPECTED_RULES, "Verified rules must match EXPECTED_RULES exactly in sequence")
+
+        # Verify mitmdump arguments
         self.assertTrue(self.mitm_log.exists(), "mitmdump should have been executed")
         mitm_args = self.mitm_log.read_text(encoding="utf-8")
         self.assertIn("--listen-host 0.0.0.0", mitm_args)
         self.assertIn("--listen-port 8080", mitm_args)
         self.assertIn("--scripts", mitm_args)
+
+    def test_rule_ordering_prohibits_bypass_before_established_related(self):
+        """Security invariant: Prohibited destination drops must strictly precede ESTABLISHED,RELATED acceptance."""
+        iptables_body = """
+echo "iptables $*" >> "${INVOCATIONS_LOG}"
+exit 0
+"""
+        self._create_mock_script("iptables", iptables_body)
+        self._create_mock_script("mitmdump", "exit 0\n")
+        self._create_mock_script("gosu", 'shift; exec "$@"\n')
+
+        result = self._run_entrypoint()
+        self.assertEqual(result.returncode, 0)
+
+        log_lines = self.log_file.read_text(encoding="utf-8").splitlines()
+        installed_rules = [
+            line[len("iptables -A OUTPUT "):]
+            for line in log_lines
+            if line.startswith("iptables -A OUTPUT ")
+        ]
+
+        # Locate critical transition points
+        conntrack_rule = "-m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT"
+        loopback_accept = "-o lo -j ACCEPT"
+        loopback_drop = "-d 127.0.0.0/8 -j DROP"
+        default_drop = "-j DROP"
+
+        self.assertIn(conntrack_rule, installed_rules)
+        conntrack_idx = installed_rules.index(conntrack_rule)
+
+        self.assertIn(loopback_accept, installed_rules)
+        loopback_accept_idx = installed_rules.index(loopback_accept)
+
+        self.assertIn(loopback_drop, installed_rules)
+        loopback_drop_idx = installed_rules.index(loopback_drop)
+
+        # 1. Intra-container loopback acceptance must precede external loopback drop
+        self.assertLess(
+            loopback_accept_idx,
+            loopback_drop_idx,
+            "-o lo -j ACCEPT must precede -d 127.0.0.0/8 -j DROP so internal IPC succeeds",
+        )
+
+        # 2. External loopback drop must precede ESTABLISHED,RELATED acceptance
+        self.assertLess(
+            loopback_drop_idx,
+            conntrack_idx,
+            "-d 127.0.0.0/8 -j DROP must precede conntrack acceptance",
+        )
+
+        # 3. All prohibited destination drops must precede ESTABLISHED,RELATED
+        prohibited_prefixes = [
+            "-d 169.254.",
+            "-d 10.",
+            "-d 172.16.",
+            "-d 192.168.",
+            "-d 100.64.",
+            "-d 198.18.",
+            "-d 198.51.100.",
+            "-d 203.0.113.",
+            "-d 240.0.0.",
+        ]
+        for prefix in prohibited_prefixes:
+            matching_indices = [
+                i for i, r in enumerate(installed_rules) if r.startswith(prefix)
+            ]
+            self.assertTrue(matching_indices, f"Rule with prefix {prefix} must be present in installed rules")
+            for idx in matching_indices:
+                self.assertLess(
+                    idx,
+                    conntrack_idx,
+                    f"Prohibited rule '{installed_rules[idx]}' (index {idx}) must precede conntrack rule (index {conntrack_idx})",
+                )
+
+        # 4. Default drop is the final rule
+        self.assertEqual(
+            installed_rules[-1],
+            default_drop,
+            f"The final rule in the chain must be default deny '{default_drop}'",
+        )
 
     def test_missing_addon_script_fails_closed(self):
         """Proxy must exit nonzero if addon script does not exist, even if firewall passed."""

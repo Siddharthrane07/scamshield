@@ -4,7 +4,14 @@
 #
 # Lifecycle:
 #   1. Validates presence and permissions of required firewall tooling (iptables).
-#   2. Installs required IPv4 kernel egress filtering rules, checking each rule.
+#   2. Installs required IPv4 kernel egress filtering rules in strict security order:
+#      - Phase 1: Unconditional prohibited destination IP drops (metadata, private, reserved).
+#                 Must precede stateful acceptance so ESTABLISHED/RELATED state cannot bypass.
+#      - Phase 2: Intra-container loopback interface acceptance (-o lo -j ACCEPT).
+#      - Phase 3: Prohibit loopback-addressed traffic on external interfaces (-d 127.0.0.0/8 -j DROP).
+#      - Phase 4: Stateful return traffic acceptance for allowed public destinations.
+#      - Phase 5: Transport & port rules for validated public traffic (DNS, HTTP, HTTPS).
+#      - Phase 6: Default deny all remaining outbound traffic (-j DROP).
 #   3. Verifies the effective ruleset in kernel memory (via iptables -C).
 #   4. Validates runtime directories and production addon existence.
 #   5. Steps down root privileges (if root) to unprivileged user 'proxy' (uid 1002).
@@ -79,13 +86,27 @@ fi
 # -----------------------------------------------------------------------------
 # 2. Kernel-level Egress Filtering Installation
 # -----------------------------------------------------------------------------
-# Even though track_c_proxy_addon.py performs connection-time DNS validation
-# and pins literal IPs, we enforce iptables DROP rules at the kernel level
-# to guarantee no private or metadata IP can ever receive an outbound packet.
+# Strict Rule Ordering Rationale:
+#   Phase 1 (Unconditional Destination Drops):
+#     Must precede Phase 4 (ESTABLISHED,RELATED). If stateful acceptance came
+#     first, reply packets to inbound connections from private subnets or
+#     packets matched by connection tracking helpers would bypass deny rules.
+#
+#   Phase 2 (Intra-Container Loopback Acceptance) & Phase 3 (External Loopback Drop):
+#     -o lo -j ACCEPT allows legitimate intra-container IPC on the loopback
+#     interface (e.g., container healthchecks hitting 127.0.0.1:8080).
+#     -d 127.0.0.0/8 -j DROP immediately follows to ensure that any packet
+#     addressed to loopback that attempts to leave via non-lo interfaces (e.g. eth0)
+#     is blocked.
+#
+#   Phase 4 (Stateful Return Traffic Acceptance):
+#     Only reachable if destination is NOT in any prohibited range from Phase 1-3.
+#
+#   Phase 5 & 6 (Port Whitelist and Default Deny):
+#     Permits outbound DNS (53) and HTTP/HTTPS (80/443); drops all remaining.
 # -----------------------------------------------------------------------------
 REQUIRED_RULES=(
-    "-o lo -j ACCEPT"
-    "-m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT"
+    # Phase 1: Prohibited destination drops (unconditional, precedes stateful acceptance)
     "-d 169.254.169.254/32 -j DROP"
     "-d 169.254.0.0/16 -j DROP"
     "-d 10.0.0.0/8 -j DROP"
@@ -96,12 +117,24 @@ REQUIRED_RULES=(
     "-d 198.51.100.0/24 -j DROP"
     "-d 203.0.113.0/24 -j DROP"
     "-d 240.0.0.0/4 -j DROP"
+
+    # Phase 2: Intra-container loopback interface communication
+    "-o lo -j ACCEPT"
+
+    # Phase 3: Prohibit loopback-addressed traffic on external interfaces
     "-d 127.0.0.0/8 -j DROP"
+
+    # Phase 4: Stateful return traffic acceptance (for permitted public destinations only)
+    "-m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT"
+
+    # Phase 5: Permitted outbound transport & port rules
     "-p udp --dport 53 -j ACCEPT"
     "-p tcp --dport 53 -j ACCEPT"
     "-p udp -j DROP"
     "-p tcp --dport 80 -j ACCEPT"
     "-p tcp --dport 443 -j ACCEPT"
+
+    # Phase 6: Default deny for all remaining outbound traffic
     "-j DROP"
 )
 
