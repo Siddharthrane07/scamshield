@@ -3,15 +3,59 @@
 # ScamShield AI — Track C Proxy Container Entrypoint
 #
 # Lifecycle:
-#   1. Applies kernel-level iptables egress filtering (if NET_ADMIN is granted).
-#   2. Validates runtime directories and permissions.
-#   3. Drops root privileges and execs mitmdump as unprivileged user 'proxy' (uid 1002).
+#   1. Validates presence and permissions of required firewall tooling (iptables).
+#   2. Installs required IPv4 kernel egress filtering rules, checking each rule.
+#   3. Verifies the effective ruleset in kernel memory (via iptables -C).
+#   4. Validates runtime directories and production addon existence.
+#   5. Steps down root privileges (if root) to unprivileged user 'proxy' (uid 1002).
+#   6. Executes mitmdump with track_c_proxy_addon.py.
+#
+# Failure Policy:
+#   Fail-closed. If firewall tooling, permissions, rule installation, or
+#   verification fails, this script exits nonzero immediately and REFUSES
+#   to launch mitmdump.
+#
+# IPv4 / IPv6 POLICY SPECIFICATION AND CURRENT LIMITATIONS:
+# -----------------------------------------------------------------------------
+# Current Scope:
+#   This entrypoint installs and verifies IPv4 egress filtering via iptables.
+#
+# Known Limitations:
+#   IPv6 egress filtering is NOT enforced by this script. If the container or
+#   host environment has IPv6 routing enabled, outbound IPv6 packets are not
+#   filtered by these IPv4 iptables rules.
+#
+# Exact Requirement for IPv6 Enforcement (Separate Approved Change):
+#   To achieve full dual-stack network perimeter enforcement, an approved change
+#   must:
+#   1. Verify ip6tables (or nftables inet family) tooling and CAP_NET_ADMIN.
+#   2. Install explicit IPv6 rules:
+#      - ip6tables -A OUTPUT -o lo -j ACCEPT
+#      - ip6tables -A OUTPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+#      - ip6tables -A OUTPUT -d ::1/128 -j DROP
+#      - ip6tables -A OUTPUT -d fc00::/7 -j DROP (IPv6 Unique Local Addresses)
+#      - ip6tables -A OUTPUT -d fe80::/10 -j DROP (IPv6 Link-Local Addresses)
+#      - ip6tables -A OUTPUT -d 2001:db8::/32 -j DROP (Documentation)
+#      - ip6tables -A OUTPUT -p udp --dport 53 -j ACCEPT
+#      - ip6tables -A OUTPUT -p tcp --dport 53 -j ACCEPT
+#      - ip6tables -A OUTPUT -p udp -j DROP
+#      - ip6tables -A OUTPUT -p tcp --dport 80 -j ACCEPT
+#      - ip6tables -A OUTPUT -p tcp --dport 443 -j ACCEPT
+#      - ip6tables -A OUTPUT -j DROP
+#      OR disable IPv6 entirely at container runtime via:
+#      --sysctl net.ipv6.conf.all.disable_ipv6=1
+#   3. Add verification for all IPv6 rules prior to proxy startup.
 # =============================================================================
 
 set -euo pipefail
 
 log() {
     echo "[$(date -u +'%Y-%m-%dT%H:%M:%SZ')] [proxy-init] $*"
+}
+
+fatal() {
+    echo "[$(date -u +'%Y-%m-%dT%H:%M:%SZ')] [proxy-init] [FATAL] $*" >&2
+    exit 1
 }
 
 PROXY_HOST="${PROXY_HOST:-0.0.0.0}"
@@ -22,79 +66,93 @@ ADDON_SCRIPT="${ADDON_SCRIPT:-/app/proxy_addon.py}"
 log "Starting ScamShield Track C Proxy Container initialization..."
 
 # -----------------------------------------------------------------------------
-# 1. Kernel-level Egress Filtering (Defense-in-Depth)
+# 1. Verify Required Firewall Tooling and Permissions (Fail-Closed)
+# -----------------------------------------------------------------------------
+if ! command -v iptables >/dev/null 2>&1; then
+    fatal "Required firewall binary 'iptables' not found in PATH. Cannot enforce container egress perimeter."
+fi
+
+if ! iptables -L OUTPUT -n >/dev/null 2>&1; then
+    fatal "Insufficient permissions to inspect/modify iptables (CAP_NET_ADMIN missing). Cannot enforce container egress perimeter."
+fi
+
+# -----------------------------------------------------------------------------
+# 2. Kernel-level Egress Filtering Installation
 # -----------------------------------------------------------------------------
 # Even though track_c_proxy_addon.py performs connection-time DNS validation
 # and pins literal IPs, we enforce iptables DROP rules at the kernel level
 # to guarantee no private or metadata IP can ever receive an outbound packet.
 # -----------------------------------------------------------------------------
-if command -v iptables >/dev/null 2>&1 && iptables -L -n >/dev/null 2>&1; then
-    log "Applying kernel egress firewall rules..."
+REQUIRED_RULES=(
+    "-o lo -j ACCEPT"
+    "-m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT"
+    "-d 169.254.169.254/32 -j DROP"
+    "-d 169.254.0.0/16 -j DROP"
+    "-d 10.0.0.0/8 -j DROP"
+    "-d 172.16.0.0/12 -j DROP"
+    "-d 192.168.0.0/16 -j DROP"
+    "-d 100.64.0.0/10 -j DROP"
+    "-d 198.18.0.0/15 -j DROP"
+    "-d 198.51.100.0/24 -j DROP"
+    "-d 203.0.113.0/24 -j DROP"
+    "-d 240.0.0.0/4 -j DROP"
+    "-d 127.0.0.0/8 -j DROP"
+    "-p udp --dport 53 -j ACCEPT"
+    "-p tcp --dport 53 -j ACCEPT"
+    "-p udp -j DROP"
+    "-p tcp --dport 80 -j ACCEPT"
+    "-p tcp --dport 443 -j ACCEPT"
+    "-j DROP"
+)
 
-    # Allow local container loopback interface communication
-    iptables -A OUTPUT -o lo -j ACCEPT
-
-    # Allow established and related connections (return traffic)
-    iptables -A OUTPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
-
-    # Block access to AWS/Cloud instance metadata IP
-    iptables -A OUTPUT -d 169.254.169.254/32 -j DROP
-    iptables -A OUTPUT -d 169.254.0.0/16 -j DROP
-
-    # Block RFC 1918 private IPv4 subnets
-    iptables -A OUTPUT -d 10.0.0.0/8 -j DROP
-    iptables -A OUTPUT -d 172.16.0.0/12 -j DROP
-    iptables -A OUTPUT -d 192.168.0.0/16 -j DROP
-
-    # Block shared address space (CGNAT, RFC 6598) and benchmark/test nets
-    iptables -A OUTPUT -d 100.64.0.0/10 -j DROP
-    iptables -A OUTPUT -d 198.18.0.0/15 -j DROP
-    iptables -A OUTPUT -d 198.51.100.0/24 -j DROP
-    iptables -A OUTPUT -d 203.0.113.0/24 -j DROP
-    iptables -A OUTPUT -d 240.0.0.0/4 -j DROP
-
-    # Block direct loopback range over external interfaces
-    iptables -A OUTPUT -d 127.0.0.0/8 -j DROP
-
-    # Block direct outbound UDP (proxy communicates upstream exclusively via TCP)
-    # DNS queries to the resolver (port 53) are permitted if needed
-    iptables -A OUTPUT -p udp --dport 53 -j ACCEPT
-    iptables -A OUTPUT -p tcp --dport 53 -j ACCEPT
-    iptables -A OUTPUT -p udp -j DROP
-
-    # Allow outbound HTTP and HTTPS to validated public IPs
-    iptables -A OUTPUT -p tcp --dport 80 -j ACCEPT
-    iptables -A OUTPUT -p tcp --dport 443 -j ACCEPT
-
-    # Default policy for remaining outbound traffic: DROP
-    iptables -A OUTPUT -j DROP
-
-    log "Kernel egress firewall rules applied successfully."
-else
-    log "Notice: iptables capability (CAP_NET_ADMIN) not detected. Relying on application-level enforcement (track_c_proxy_addon)."
-fi
+log "Installing required kernel egress firewall rules..."
+for rule in "${REQUIRED_RULES[@]}"; do
+    log "Installing rule: iptables -A OUTPUT ${rule}"
+    # shellcheck disable=SC2086
+    if ! iptables -A OUTPUT ${rule}; then
+        fatal "Failed to install required iptables rule: iptables -A OUTPUT ${rule}"
+    fi
+done
+log "All ${#REQUIRED_RULES[@]} required firewall rules installed successfully."
 
 # -----------------------------------------------------------------------------
-# 2. Directory and Permission Validation
+# 3. Post-Installation Ruleset Verification
+# -----------------------------------------------------------------------------
+# Ensure every required rule is confirmed active in the kernel OUTPUT chain.
+# If verification fails for any rule, abort immediately and refuse to run mitmproxy.
+# -----------------------------------------------------------------------------
+log "Verifying effective kernel firewall ruleset..."
+for rule in "${REQUIRED_RULES[@]}"; do
+    # shellcheck disable=SC2086
+    if ! iptables -C OUTPUT ${rule} >/dev/null 2>&1; then
+        fatal "Firewall verification failed: rule 'iptables -C OUTPUT ${rule}' is missing or inactive in kernel."
+    fi
+done
+log "Kernel firewall ruleset verified: all ${#REQUIRED_RULES[@]} required rules active."
+
+# -----------------------------------------------------------------------------
+# 4. Directory and Addon Script Validation
 # -----------------------------------------------------------------------------
 mkdir -p "${CONF_DIR}"
-chown -R proxy:proxy /sandbox "${CONF_DIR}"
+chown -R proxy:proxy /sandbox "${CONF_DIR}" 2>/dev/null || true
 
 if [ ! -f "${ADDON_SCRIPT}" ]; then
-    log "ERROR: Proxy addon script not found at ${ADDON_SCRIPT}!"
-    exit 1
+    fatal "Proxy addon script not found at ${ADDON_SCRIPT}!"
 fi
 
 log "Configuration directory and addon verified."
 log "Listening on ${PROXY_HOST}:${PROXY_PORT} with script: ${ADDON_SCRIPT}"
 
 # -----------------------------------------------------------------------------
-# 3. Privilege Step-Down and Process Execution
+# 5. Privilege Step-Down and Process Execution
 # -----------------------------------------------------------------------------
-# If currently root (e.g. for iptables configuration), step down to user 'proxy' (uid 1002)
+# If currently root (for iptables configuration), step down to user 'proxy' (uid 1002)
 # using gosu so mitmdump runs entirely without root privileges.
 # -----------------------------------------------------------------------------
 if [ "$(id -u)" -eq 0 ]; then
+    if ! command -v gosu >/dev/null 2>&1; then
+        fatal "Required privilege-drop utility 'gosu' not found in PATH."
+    fi
     log "Dropping root privileges to user 'proxy' (UID 1002)..."
     exec gosu proxy mitmdump \
         --listen-host "${PROXY_HOST}" \
@@ -104,7 +162,7 @@ if [ "$(id -u)" -eq 0 ]; then
         --set "flow_detail=1" \
         --termlog-verbosity info
 else
-    log "Already running as unprivileged user ($(id -u)). Executing mitmdump..."
+    log "Running as unprivileged user ($(id -u)). Executing mitmdump..."
     exec mitmdump \
         --listen-host "${PROXY_HOST}" \
         --listen-port "${PROXY_PORT}" \
