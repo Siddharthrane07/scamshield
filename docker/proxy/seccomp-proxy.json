@@ -6,7 +6,7 @@
     "SCMP_ARCH_AARCH64"
   ],
   "syscalls": [
-    {
+    {                                                                                                                                     
       "names": [
         "ptrace",
         "process_vm_readv",

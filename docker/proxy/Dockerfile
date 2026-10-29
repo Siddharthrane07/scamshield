@@ -27,8 +27,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 # Create dedicated unprivileged user and group for the proxy worker
-RUN groupadd -g 1002 proxy && \
-    useradd -u 1002 -g 1002 -s /sbin/nologin -d /sandbox proxy
+RUN groupadd -g 1002 proxy || true && \
+    useradd -u 1002 -g 1002 -s /sbin/nologin -d /sandbox proxy || true
 
 # Install pinned proxy dependencies
 # Note: mitmproxy>=10.4,<11 is the exact version validated during Track C audit
