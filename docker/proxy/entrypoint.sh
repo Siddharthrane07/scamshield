@@ -193,7 +193,7 @@ if [ "$(id -u)" -eq 0 ]; then
         --scripts "${ADDON_SCRIPT}" \
         --set "confdir=${CONF_DIR}" \
         --set "flow_detail=1" \
-        --termlog-verbosity info
+        --set "termlog_verbosity=info"
 else
     log "Running as unprivileged user ($(id -u)). Executing mitmdump..."
     exec mitmdump \
@@ -202,5 +202,5 @@ else
         --scripts "${ADDON_SCRIPT}" \
         --set "confdir=${CONF_DIR}" \
         --set "flow_detail=1" \
-        --termlog-verbosity info
+        --set "termlog_verbosity=info"
 fi

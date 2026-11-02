@@ -124,7 +124,13 @@ class TestTrackCProxyEntrypointHardening(unittest.TestCase):
         if env_overrides:
             env.update(env_overrides)
 
-        cmd = [self.bash_exe, str(_ENTRYPOINT_SCRIPT).replace("\\", "/")]
+        mock_path_str = str(self.mock_bin_dir).replace("\\", "/")
+        script_posix = str(_ENTRYPOINT_SCRIPT).replace("\\", "/")
+        cmd = [
+            self.bash_exe,
+            "-c",
+            f'export PATH="$(cd "{mock_path_str}" && pwd):$PATH"; exec "{script_posix}"',
+        ]
         result = subprocess.run(
             cmd,
             capture_output=True,
@@ -272,6 +278,8 @@ exec "$@"
         self.assertIn("--listen-host 0.0.0.0", mitm_args)
         self.assertIn("--listen-port 8080", mitm_args)
         self.assertIn("--scripts", mitm_args)
+        self.assertIn("--set termlog_verbosity=info", mitm_args)
+        self.assertNotIn("--termlog-verbosity", mitm_args)
 
     def test_rule_ordering_prohibits_bypass_before_established_related(self):
         """Security invariant: Prohibited destination drops must strictly precede ESTABLISHED,RELATED acceptance."""
@@ -367,6 +375,65 @@ exit 0
         self.assertIn("FATAL", output)
         self.assertIn("Proxy addon script not found", output)
         self.assertFalse(self.mitm_log.exists(), "mitmdump must not be executed when addon is missing")
+
+    def test_mitmdump_cli_arguments_both_execution_branches(self):
+        """Verify neither execution branch (root vs unprivileged) passes unsupported CLI arguments."""
+        iptables_body = """
+echo "iptables $*" >> "${INVOCATIONS_LOG}"
+exit 0
+"""
+        self._create_mock_script("iptables", iptables_body)
+        mitmdump_body = """
+echo "mitmdump $*" > "${MITM_LOG}"
+exit 0
+"""
+        self._create_mock_script("mitmdump", mitmdump_body)
+        gosu_body = """
+echo "gosu $*" >> "${INVOCATIONS_LOG}"
+shift
+exec "$@"
+"""
+        self._create_mock_script("gosu", gosu_body)
+
+        # Branch 1: Root execution (id -u returns 0)
+        id_root_body = """
+if [ "$1" = "-u" ]; then
+    echo "0"
+    exit 0
+fi
+exit 0
+"""
+        self._create_mock_script("id", id_root_body)
+        res_root = self._run_entrypoint()
+        self.assertEqual(res_root.returncode, 0, f"Root startup branch failed: {res_root.stderr}")
+        self.assertTrue(self.mitm_log.exists(), "mitmdump should have executed in root branch")
+        mitm_root_args = self.mitm_log.read_text(encoding="utf-8")
+        self.assertIn("--set termlog_verbosity=info", mitm_root_args)
+        self.assertNotIn("--termlog-verbosity", mitm_root_args)
+        invocations_root = self.log_file.read_text(encoding="utf-8")
+        self.assertIn("gosu proxy mitmdump", invocations_root)
+
+        # Reset logs for Branch 2
+        self.mitm_log.unlink()
+        self.log_file.unlink()
+
+        # Branch 2: Unprivileged execution (id -u returns 1002)
+        id_unpriv_body = """
+if [ "$1" = "-u" ]; then
+    echo "1002"
+    exit 0
+fi
+exit 0
+"""
+        self._create_mock_script("id", id_unpriv_body)
+        res_unpriv = self._run_entrypoint()
+        self.assertEqual(res_unpriv.returncode, 0, f"Unprivileged startup branch failed: {res_unpriv.stderr}")
+        self.assertTrue(self.mitm_log.exists(), "mitmdump should have executed in unprivileged branch")
+        mitm_unpriv_args = self.mitm_log.read_text(encoding="utf-8")
+        self.assertIn("--set termlog_verbosity=info", mitm_unpriv_args)
+        self.assertNotIn("--termlog-verbosity", mitm_unpriv_args)
+        invocations_unpriv = self.log_file.read_text(encoding="utf-8") if self.log_file.exists() else ""
+        self.assertNotIn("gosu", invocations_unpriv, "gosu should not be called in unprivileged branch")
 
 
 if __name__ == "__main__":
