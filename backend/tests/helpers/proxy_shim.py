@@ -120,6 +120,12 @@ _SYNTHETIC_HOSTS = {
     "dynamic-rebind-safe.test": ["93.184.216.35"],
     # Case B: Mixed safe (93.184.216.34) and prohibited (127.0.0.1) answers
     "dynamic-rebind-mixed.test": ["93.184.216.34", "127.0.0.1"],
+    # Case C: IPv6 Prohibited loopback target (::1)
+    "dynamic-rebind-ipv6-prohibited.test": ["::1"],
+    # Case D: IPv6 Unique-Local Address target (fc00::1)
+    "dynamic-rebind-ipv6-ula.test": ["fc00::1"],
+    # Case E: Mixed IPv6 public and prohibited (2606:2800:220:1:248:1893:25c8:1946 and ::1)
+    "dynamic-rebind-ipv6-mixed.test": ["2606:2800:220:1:248:1893:25c8:1946", "::1"],
 }
 
 _ALLOWED_SYNTHETIC_HOSTS = frozenset({

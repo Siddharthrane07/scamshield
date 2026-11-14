@@ -84,13 +84,9 @@ def _wait_for_port(host: str, port: int, timeout: float = 10.0) -> bool:
     return False
 
 
-def _find_mitmdump() -> str:
+def _find_mitmdump() -> list[str]:
     """
-    Locate the mitmdump binary inside the active venv.
-
-    On Windows the Scripts directory contains mitmdump.exe; on POSIX it is
-    a plain executable in bin/.  We derive the path from sys.executable so
-    the function works regardless of how the venv is activated.
+    Locate the mitmdump binary inside the active venv or fallback to python module.
     """
     scripts_dir = pathlib.Path(sys.executable).parent
     candidates = [
@@ -99,11 +95,13 @@ def _find_mitmdump() -> str:
     ]
     for candidate in candidates:
         if candidate.exists():
-            return str(candidate)
-    raise FileNotFoundError(
-        f"mitmdump binary not found in {scripts_dir}. "
-        "Install mitmproxy with: python -m pip install 'mitmproxy>=10.4,<11'"
-    )
+            try:
+                res = subprocess.run([str(candidate), "--version"], capture_output=True, timeout=2)
+                if res.returncode == 0:
+                    return [str(candidate)]
+            except Exception:
+                pass
+    return [sys.executable, "-c", "from mitmproxy.tools.main import mitmdump; mitmdump()"]
 
 
 def _start_mitmdump(
@@ -117,11 +115,6 @@ def _start_mitmdump(
     Launch mitmdump (the non-interactive dump binary) in the background,
     loading the given addon script.
 
-    We deliberately use the mitmdump.exe binary rather than
-    ``python -m mitmproxy.tools.main``.  The latter is the interactive TUI
-    entrypoint and exits immediately when it detects no terminal.
-    mitmdump is the headless mode designed for scripted/automated use.
-
     Returns the Popen object; caller is responsible for termination.
     """
     env = os.environ.copy()
@@ -132,8 +125,7 @@ def _start_mitmdump(
     if extra_env:
         env.update(extra_env)
 
-    cmd = [
-        _find_mitmdump(),
+    cmd = list(_find_mitmdump()) + [
         "--listen-host", "127.0.0.1",
         "--listen-port", str(proxy_port),
         "--quiet",

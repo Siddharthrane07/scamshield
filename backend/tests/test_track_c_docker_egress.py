@@ -108,13 +108,20 @@ class TestTrackCDockerEgressLive(unittest.TestCase):
 
         start_res = _run_docker(cmd)
         self.assertEqual(start_res.returncode, 0, f"Failed to start container: {start_res.stderr}")
-        time.sleep(wait_seconds)
 
-        logs_res = _run_docker(["logs", name])
-        self.assertIn("IPv4 kernel firewall ruleset verified", logs_res.stdout)
-        self.assertIn("IPv6 kernel firewall ruleset verified", logs_res.stdout)
-        self.assertIn("HTTP(S) proxy listening at *:8080.", logs_res.stdout)
-        return logs_res.stdout
+        # Deterministic log polling: wait until mitmdump reports ready or deadline
+        deadline = time.monotonic() + 10.0
+        logs = ""
+        while time.monotonic() < deadline:
+            logs = _run_docker(["logs", name]).stdout
+            if "HTTP(S) proxy listening at *:8080." in logs:
+                break
+            time.sleep(0.5)
+
+        self.assertIn("IPv4 kernel firewall ruleset verified", logs)
+        self.assertIn("IPv6 kernel firewall ruleset verified", logs)
+        self.assertIn("HTTP(S) proxy listening at *:8080.", logs)
+        return logs
 
     def _get_iptables_counters(self, container=CONTAINER_NAME):
         """Retrieve verbose iptables OUTPUT ruleset with packet and byte counters."""

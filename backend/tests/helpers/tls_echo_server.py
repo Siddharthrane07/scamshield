@@ -30,6 +30,15 @@ from pathlib import Path
 
 class _TLSEchoHandler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:
+        if self.path.startswith("/redirect_prohibited"):
+            target = "http://127.0.0.1:19101/evil"
+            if "?target=" in self.path:
+                target = self.path.split("?target=")[1]
+            self.send_response(302)
+            self.send_header("Location", target)
+            self.end_headers()
+            return
+
         payload = json.dumps({"tls_echo": "ok", "path": self.path}).encode()
         self.send_response(200)
         self.send_header("Content-Type", "application/json")

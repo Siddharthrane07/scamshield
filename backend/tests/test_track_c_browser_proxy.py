@@ -78,7 +78,7 @@ def _wait_for_port(host: str, port: int, timeout: float = 10.0) -> bool:
     return False
 
 
-def _find_mitmdump() -> str:
+def _find_mitmdump() -> list[str]:
     scripts_dir = pathlib.Path(sys.executable).parent
     candidates = [
         scripts_dir / "mitmdump.exe",
@@ -86,8 +86,13 @@ def _find_mitmdump() -> str:
     ]
     for c in candidates:
         if c.exists():
-            return str(c)
-    raise FileNotFoundError(f"mitmdump binary not found in {scripts_dir}")
+            try:
+                res = subprocess.run([str(c), "--version"], capture_output=True, timeout=2)
+                if res.returncode == 0:
+                    return [str(c)]
+            except Exception:
+                pass
+    return [sys.executable, "-c", "from mitmproxy.tools.main import mitmdump; mitmdump()"]
 
 
 def _start_mitmdump(
@@ -103,8 +108,7 @@ def _start_mitmdump(
     env["SCAMSHIELD_SIDECAR_PATH"] = sidecar_path
     env["SCAMSHIELD_PROHIBITED_TEST_PORTS"] = f"{PORT_BLACKHOLE},{PORT_CANARY_TCP},{PORT_PROD_LOOPBACK},19001"
 
-    cmd = [
-        _find_mitmdump(),
+    cmd = list(_find_mitmdump()) + [
         "--listen-host", "127.0.0.1",
         "--listen-port", str(proxy_port),
         "--quiet",
@@ -379,6 +383,38 @@ class TestTrackCBrowserProxy(unittest.TestCase):
             browser.close()
 
     # -------------------------------------------------------------------------
+    # BR-02b: Cross-origin HTTPS redirect to prohibited IP fails closed
+    # -------------------------------------------------------------------------
+    def test_br02b_cross_origin_https_redirect_to_prohibited_destination(self):
+        """BR-02b: HTTPS 302 redirecting to prohibited destination is blocked at connection time."""
+        before_count = self.blackhole.connection_count
+        browser, _ = launch_hardened_browser(self.playwright, PORT_BROWSER_PROXY, self.test_ca_spki_hash)
+        try:
+            page = browser.new_page()
+            try:
+                resp = page.goto(
+                    f"https://test-origin.local:{PORT_TLS_ECHO}/redirect_prohibited",
+                    timeout=8000,
+                )
+                self.assertGreaterEqual(resp.status, 400)
+            except PlaywrightError:
+                pass
+            # Network evidence: black-hole listener accepted 0 connections
+            self.assertEqual(
+                self.blackhole.connection_count, before_count,
+                f"Security breach: blackhole accepted {self.blackhole.connection_count - before_count} connection(s) via HTTPS redirect!",
+            )
+            # Verify proxy sidecar recorded blocked evaluation
+            sidecar = self._read_sidecar()
+            blocked_evals = [
+                e for e in sidecar.get("evaluations", [])
+                if e.get("port") == PORT_BLACKHOLE and e.get("blocked") is True
+            ]
+            self.assertGreaterEqual(len(blocked_evals), 1, "Expected blocked evaluation for redirected destination")
+        finally:
+            browser.close()
+
+    # -------------------------------------------------------------------------
     # BR-03: Subresources individually validated & blocked
     # -------------------------------------------------------------------------
     def test_br03_subresource_interception_and_rejection(self):
@@ -517,6 +553,43 @@ class TestTrackCBrowserProxy(unittest.TestCase):
                 self.canary.connection_count, 0,
                 f"Security Leak: Canary accepted {self.canary.connection_count} direct connection(s)!"
             )
+        finally:
+            browser.close()
+
+    # -------------------------------------------------------------------------
+    # BR-05b: Direct IPv6 and prohibited destinations (metadata, RFC1918) blocked
+    # -------------------------------------------------------------------------
+    def test_br05b_direct_prohibited_and_ipv6_destinations_blocked(self):
+        """BR-05b: Direct attempts to IPv6 loopback, cloud metadata, and RFC1918 IPs fail closed."""
+        browser, _ = launch_hardened_browser(self.playwright, PORT_PROD_PROXY, self.test_ca_spki_hash)
+        try:
+            page = browser.new_page()
+
+            # 1. Direct IPv6 loopback attempt: http://[::1]:<PORT_CANARY_TCP>/leak
+            self.canary.reset()
+            try:
+                resp = page.goto(f"http://[::1]:{PORT_CANARY_TCP}/leak", timeout=4000)
+                self.assertGreaterEqual(resp.status, 400)
+            except PlaywrightError:
+                pass
+            self.assertEqual(self.canary.connection_count, 0, "Direct IPv6 loopback leaked to canary!")
+
+            # 2. Direct AWS Metadata attempt: http://169.254.169.254:<PORT_BLACKHOLE>/latest/meta-data
+            before_count = self.blackhole.connection_count
+            try:
+                resp = page.goto(f"http://169.254.169.254:{PORT_BLACKHOLE}/latest/meta-data", timeout=4000)
+                self.assertGreaterEqual(resp.status, 400)
+            except PlaywrightError:
+                pass
+            self.assertEqual(self.blackhole.connection_count, before_count, "Direct metadata attempt reached network!")
+
+            # 3. Direct RFC1918 attempt: http://10.0.0.1:<PORT_BLACKHOLE>/internal
+            try:
+                resp = page.goto(f"http://10.0.0.1:{PORT_BLACKHOLE}/internal", timeout=4000)
+                self.assertGreaterEqual(resp.status, 400)
+            except PlaywrightError:
+                pass
+            self.assertEqual(self.blackhole.connection_count, before_count, "Direct RFC1918 attempt reached network!")
         finally:
             browser.close()
 
@@ -705,6 +778,68 @@ class TestTrackCBrowserProxy(unittest.TestCase):
         self.assertFalse(browser.is_connected())
 
     # -------------------------------------------------------------------------
+    # BR-09c: Mid-session proxy termination fail-closed test
+    # -------------------------------------------------------------------------
+    def test_br09c_proxy_termination_during_active_browser_session(self):
+        """BR-09c: Mid-session proxy termination causes fail-closed behavior; zero direct fallback."""
+        self.canary.reset()
+        mid_proxy_port = 18198
+        mid_proc = _start_mitmdump(
+            str(_TESTS_DIR / "helpers" / "proxy_shim.py"),
+            self.sidecar_path,
+            mid_proxy_port,
+            str(self.tmp_dir / "mid_proxy.log"),
+        )
+        try:
+            self.assertTrue(_wait_for_port("127.0.0.1", mid_proxy_port, timeout=10.0))
+
+            # Launch browser and establish active page session
+            browser, _ = launch_hardened_browser(self.playwright, mid_proxy_port, self.test_ca_spki_hash)
+            try:
+                page = browser.new_page()
+                resp = page.goto(f"http://test-http.local:{PORT_HTTP_ECHO}/", timeout=6000)
+                self.assertEqual(resp.status, 200, "Initial page navigation failed")
+
+                # Terminate proxy while browser session is active
+                mid_proc.terminate()
+                try:
+                    mid_proc.wait(timeout=3.0)
+                except subprocess.TimeoutExpired:
+                    mid_proc.kill()
+                    mid_proc.wait(timeout=2.0)
+                if hasattr(mid_proc, "_log_file") and mid_proc._log_file:
+                    mid_proc._log_file.close()
+                    mid_proc._log_file = None
+
+                # Browser attempts subsequent navigation/request to canary port
+                with self.assertRaises(PlaywrightError) as ctx:
+                    page.goto(f"http://127.0.0.1:{PORT_CANARY_TCP}/mid-session-probe", timeout=4000)
+
+                err_str = str(ctx.exception)
+                self.assertTrue(
+                    "ERR_PROXY_CONNECTION_FAILED" in err_str
+                    or "ERR_TUNNEL_CONNECTION_FAILED" in err_str
+                    or "ERR_CONNECTION_REFUSED" in err_str,
+                    f"Unexpected mid-session error: {err_str}",
+                )
+                # Network evidence: Canary received 0 connections
+                self.assertEqual(self.canary.connection_count, 0, "Canary received fallback connection mid-session!")
+            finally:
+                browser.close()
+        finally:
+            if mid_proc:
+                if mid_proc.poll() is None:
+                    mid_proc.terminate()
+                    try:
+                        mid_proc.wait(timeout=3.0)
+                    except subprocess.TimeoutExpired:
+                        mid_proc.kill()
+                        mid_proc.wait(timeout=2.0)
+                if hasattr(mid_proc, "_log_file") and mid_proc._log_file:
+                    mid_proc._log_file.close()
+                    mid_proc._log_file = None
+
+    # -------------------------------------------------------------------------
     # BR-10: QUIC / HTTP/3 evasion prevention
     # -------------------------------------------------------------------------
     def test_br10_quic_http3_evasion_prevention(self):
@@ -840,6 +975,97 @@ class TestTrackCBrowserProxy(unittest.TestCase):
             self.assertEqual(len(connected_b), 0, "Upstream connection was established despite rejection!")
         finally:
             browser.close()
+
+    # -------------------------------------------------------------------------
+    # BR-11b: Controlled dynamic DNS rebinding (IPv6 Model 2 verification)
+    # -------------------------------------------------------------------------
+    def test_br11b_ipv6_dynamic_dns_rebinding(self):
+        """BR-11b: IPv6 dynamic DNS mutations (loopback ::1, ULA fc00::1, mixed) are rejected."""
+        # Confirm synthetic hosts are registered
+        self.assertIn("dynamic-rebind-ipv6-prohibited.test", _SYNTHETIC_HOSTS)
+        self.assertEqual(_SYNTHETIC_HOSTS["dynamic-rebind-ipv6-prohibited.test"], ["::1"])
+        self.assertIn("dynamic-rebind-ipv6-ula.test", _SYNTHETIC_HOSTS)
+        self.assertEqual(_SYNTHETIC_HOSTS["dynamic-rebind-ipv6-ula.test"], ["fc00::1"])
+        self.assertIn("dynamic-rebind-ipv6-mixed.test", _SYNTHETIC_HOSTS)
+        self.assertEqual(_SYNTHETIC_HOSTS["dynamic-rebind-ipv6-mixed.test"], ["2606:2800:220:1:248:1893:25c8:1946", "::1"])
+
+        browser, _ = launch_hardened_browser(self.playwright, PORT_BROWSER_PROXY, self.test_ca_spki_hash)
+        try:
+            page = browser.new_page()
+
+            # Case C: IPv6 loopback target (::1) on PORT_BLACKHOLE
+            before_count = self.blackhole.connection_count
+            try:
+                resp = page.goto(f"http://dynamic-rebind-ipv6-prohibited.test:{PORT_BLACKHOLE}/", timeout=5000)
+                self.assertGreaterEqual(resp.status, 400)
+            except PlaywrightError:
+                pass
+            self.assertEqual(self.blackhole.connection_count, before_count, "IPv6 loopback rebind reached blackhole!")
+
+            # Case D: IPv6 ULA target (fc00::1) on PORT_BLACKHOLE
+            try:
+                resp = page.goto(f"http://dynamic-rebind-ipv6-ula.test:{PORT_BLACKHOLE}/", timeout=5000)
+                self.assertGreaterEqual(resp.status, 400)
+            except PlaywrightError:
+                pass
+            self.assertEqual(self.blackhole.connection_count, before_count, "IPv6 ULA rebind reached blackhole!")
+
+            # Case E: Mixed safe public IPv6 and prohibited loopback (2606:... and ::1)
+            try:
+                resp = page.goto(f"http://dynamic-rebind-ipv6-mixed.test:{PORT_BLACKHOLE}/", timeout=5000)
+                self.assertGreaterEqual(resp.status, 400)
+            except PlaywrightError:
+                pass
+            self.assertEqual(self.blackhole.connection_count, before_count, "IPv6 mixed rebind reached blackhole!")
+
+            # Verify sidecar recorded blocked evaluations for IPv6
+            sidecar = self._read_sidecar()
+            evals = sidecar.get("evaluations", [])
+            ipv6_blocked = [
+                e for e in evals
+                if "dynamic-rebind-ipv6" in e.get("host", "") and e.get("blocked") is True
+            ]
+            self.assertGreaterEqual(len(ipv6_blocked), 3, f"Expected 3 blocked IPv6 evaluations, got {len(ipv6_blocked)}")
+        finally:
+            browser.close()
+
+    # -------------------------------------------------------------------------
+    # BR-12: Chromium DNS Isolation & Flags Audit
+    # -------------------------------------------------------------------------
+    def test_br12_chromium_dns_isolation_and_flags_audit(self):
+        """BR-12: Chromium flags audit: DoH and AsyncDNS disabled; no direct browser DNS resolution."""
+        # 1. Audit launch args
+        launch_args = self.browser_diagnostics.get("launch_args", [])
+        self.assertIn("--disable-features=DnsOverHttps,AsyncDns", launch_args)
+        self.assertIn(f"--proxy-server=http://127.0.0.1:{PORT_BROWSER_PROXY}", launch_args)
+        self.assertIn("--proxy-bypass-list=<-loopback>", launch_args)
+        self.assertIn("--force-webrtc-ip-handling-policy=disable_non_proxied_udp", launch_args)
+        self.assertIn("--disable-quic", launch_args)
+
+        # 2. Host OS DNS fails for synthetic test domains
+        with self.assertRaises(socket.gaierror):
+            socket.getaddrinfo("synthetic-target.scamshield-test", None)
+
+        # 3. Chromium succeeds when routed through proxy (proxy resolves synthetic name)
+        browser, _ = launch_hardened_browser(self.playwright, PORT_BROWSER_PROXY, self.test_ca_spki_hash)
+        try:
+            page = browser.new_page()
+            resp = page.goto(f"http://synthetic-target.scamshield-test:{PORT_HTTP_ECHO}/", timeout=6000)
+            self.assertEqual(resp.status, 200)
+        finally:
+            browser.close()
+
+        # 4. When proxy is unreachable, Chromium cannot resolve synthetic name independently
+        # and fails immediately with proxy error, proving zero direct DNS resolution.
+        bad_proxy_port = 18197
+        browser_bad, _ = launch_hardened_browser(self.playwright, bad_proxy_port, self.test_ca_spki_hash)
+        try:
+            page_bad = browser_bad.new_page()
+            with self.assertRaises(PlaywrightError) as ctx:
+                page_bad.goto(f"http://synthetic-target.scamshield-test:{PORT_HTTP_ECHO}/", timeout=4000)
+            self.assertIn("ERR_PROXY_CONNECTION_FAILED", str(ctx.exception))
+        finally:
+            browser_bad.close()
 
     # -------------------------------------------------------------------------
     # SPKI-NEG: Negative control: Unpinned/unrelated certificate rejected by Chromium
