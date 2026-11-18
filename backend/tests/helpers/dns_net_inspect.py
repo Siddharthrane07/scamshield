@@ -159,3 +159,4 @@ if __name__ == "__main__":
     test_dns_udp("192.168.65.7", 53, "example.com")
     test_dns_udp("192.168.65.7", 53, "scamshield-synthetic-test-domain-xyzzy.invalid")
     test_hostname_resolution("example.com")
+

@@ -181,7 +181,7 @@ exec "$@"
 """
         self._create_mock_script("gosu", gosu_body)
 
-    def _run_entrypoint(self, env_overrides=None):
+    def _run_entrypoint(self, env_overrides=None, timeout=60):
         env = dict(os.environ)
         # Prepend mock bin dir to PATH so mocks shadow system binaries
         env["PATH"] = str(self.mock_bin_dir) + os.pathsep + env.get("PATH", "")
@@ -207,12 +207,12 @@ exec "$@"
                 capture_output=True,
                 text=True,
                 env=env,
-                timeout=30,
+                timeout=timeout,
             )
         except subprocess.TimeoutExpired as exc:
             stdout = exc.stdout or ""
             stderr = exc.stderr or ""
-            self.fail(f"Entrypoint execution timed out after 30s.\nStdout:\n{stdout}\nStderr:\n{stderr}")
+            self.fail(f"Entrypoint execution timed out after {timeout}s.\nStdout:\n{stdout}\nStderr:\n{stderr}")
         return result
 
     # --- Tooling & Privilege Checks ---
@@ -673,6 +673,187 @@ exit 0
         self.assertNotIn("--termlog-verbosity", mitm_unpriv_args)
         invocations_unpriv = self.log_file.read_text(encoding="utf-8") if self.log_file.exists() else ""
         self.assertNotIn("gosu", invocations_unpriv, "gosu should not be called in unprivileged branch")
+
+    # --- Multi-Interface Topology & Firewall Architecture Checks ---
+
+    def _setup_multi_if_environment(
+        self,
+        internal_if="eth0",
+        external_if="eth1",
+        ext_has_default=True,
+        int_has_default=False,
+        ip_forward="0",
+    ):
+        sys_class_net = pathlib.Path(self.temp_dir.name) / "sys_class_net"
+        sys_class_net.mkdir(parents=True, exist_ok=True)
+        (sys_class_net / internal_if).mkdir(parents=True, exist_ok=True)
+        (sys_class_net / external_if).mkdir(parents=True, exist_ok=True)
+
+        proc_route = pathlib.Path(self.temp_dir.name) / "proc_route"
+        lines = [
+            "Iface\tDestination\tGateway\tFlags\tRefCnt\tUse\tMetric\tMask\tMTU\tWindow\tIRTT\n",
+            f"{internal_if}\t001C1CAC\t00000000\t0001\t0\t0\t0\t00FFFFFF\t0\t0\t0\n",
+        ]
+        if ext_has_default:
+            lines.append(f"{external_if}\t00000000\t011D1CAC\t0003\t0\t0\t0\t00000000\t0\t0\t0\n")
+        lines.append(f"{external_if}\t001D1CAC\t00000000\t0001\t0\t0\t0\t00FFFFFF\t0\t0\t0\n")
+        if int_has_default:
+            lines.append(f"{internal_if}\t00000000\t011C1CAC\t0003\t0\t0\t0\t00000000\t0\t0\t0\n")
+        proc_route.write_text("".join(lines), encoding="utf-8")
+
+        proc_ip_fwd = pathlib.Path(self.temp_dir.name) / "ip_forward"
+        proc_ip_fwd.write_text(f"{ip_forward}\n", encoding="utf-8")
+
+        return {
+            "INTERNAL_IF": internal_if,
+            "EXTERNAL_IF": external_if,
+            "SYS_CLASS_NET": str(sys_class_net).replace("\\", "/"),
+            "PROC_NET_ROUTE": str(proc_route).replace("\\", "/"),
+            "PROC_IP_FORWARD": str(proc_ip_fwd).replace("\\", "/"),
+        }
+
+    def test_multi_if_incomplete_config_fails_closed(self):
+        """Entrypoint must exit nonzero if only one of INTERNAL_IF or EXTERNAL_IF is set."""
+        self._create_default_mocks()
+        res1 = self._run_entrypoint(env_overrides={"INTERNAL_IF": "eth0", "EXTERNAL_IF": ""})
+        self.assertNotEqual(res1.returncode, 0)
+        self.assertIn("Incomplete interface configuration", res1.stdout + res1.stderr)
+
+        res2 = self._run_entrypoint(env_overrides={"INTERNAL_IF": "", "EXTERNAL_IF": "eth1"})
+        self.assertNotEqual(res2.returncode, 0)
+        self.assertIn("Incomplete interface configuration", res2.stdout + res2.stderr)
+
+    def test_multi_if_same_interface_fails_closed(self):
+        """Entrypoint must exit nonzero if INTERNAL_IF and EXTERNAL_IF are identical."""
+        self._create_default_mocks()
+        res = self._run_entrypoint(env_overrides={"INTERNAL_IF": "eth0", "EXTERNAL_IF": "eth0"})
+        self.assertNotEqual(res.returncode, 0)
+        self.assertIn("INTERNAL_IF and EXTERNAL_IF cannot be the same interface", res.stdout + res.stderr)
+
+    def test_multi_if_loopback_interface_fails_closed(self):
+        """Entrypoint must exit nonzero if 'lo' is specified as INTERNAL_IF or EXTERNAL_IF."""
+        self._create_default_mocks()
+        res1 = self._run_entrypoint(env_overrides={"INTERNAL_IF": "lo", "EXTERNAL_IF": "eth1"})
+        self.assertNotEqual(res1.returncode, 0)
+        self.assertIn("Loopback interface 'lo' cannot be designated", res1.stdout + res1.stderr)
+
+    def test_multi_if_missing_device_fails_closed(self):
+        """Entrypoint must exit nonzero if a configured interface does not exist in sysfs."""
+        self._create_default_mocks()
+        env = self._setup_multi_if_environment()
+        # Remove internal_if directory from sysfs
+        sys_class_net = pathlib.Path(env["SYS_CLASS_NET"])
+        (sys_class_net / "eth0").rmdir()
+        res = self._run_entrypoint(env_overrides=env)
+        self.assertNotEqual(res.returncode, 0)
+        self.assertIn("does not exist in container namespace", res.stdout + res.stderr)
+
+    def test_multi_if_external_missing_default_route_fails_closed(self):
+        """Entrypoint must exit nonzero if EXTERNAL_IF does not have the default gateway route."""
+        self._create_default_mocks()
+        env = self._setup_multi_if_environment(ext_has_default=False)
+        res = self._run_entrypoint(env_overrides=env)
+        self.assertNotEqual(res.returncode, 0)
+        self.assertIn("does not have a default gateway route", res.stdout + res.stderr)
+
+    def test_multi_if_internal_having_default_route_fails_closed(self):
+        """Entrypoint must exit nonzero if INTERNAL_IF has a default gateway (violates isolated network policy)."""
+        self._create_default_mocks()
+        env = self._setup_multi_if_environment(int_has_default=True)
+        res = self._run_entrypoint(env_overrides=env)
+        self.assertNotEqual(res.returncode, 0)
+        self.assertIn("must not possess a default gateway route", res.stdout + res.stderr)
+
+    def test_multi_if_topology_mismatch_fails_closed(self):
+        """Entrypoint must exit nonzero if configured EXTERNAL_IF does not match detected default interface."""
+        self._create_default_mocks()
+        env = self._setup_multi_if_environment()
+        # In route table, set default route for both eth2 (earlier) and eth1 (configured)
+        # so eth1 has a default route, but detected default interface is eth2
+        proc_route = pathlib.Path(env["PROC_NET_ROUTE"])
+        content = "Iface\tDestination\tGateway\tFlags\tRefCnt\tUse\tMetric\tMask\tMTU\tWindow\tIRTT\n"
+        content += "eth2\t00000000\t011D1CAC\t0003\t0\t0\t0\t00000000\t0\t0\t0\n"
+        content += "eth1\t00000000\t021D1CAC\t0003\t0\t0\t0\t00000000\t0\t0\t0\n"
+        content += "eth0\t001C1CAC\t00000000\t0001\t0\t0\t0\t00FFFFFF\t0\t0\t0\n"
+        proc_route.write_text(content, encoding="utf-8")
+        res = self._run_entrypoint(env_overrides=env)
+        self.assertNotEqual(res.returncode, 0)
+        self.assertIn("Topology mismatch", res.stdout + res.stderr)
+
+    def test_multi_if_active_ip_forwarding_fails_closed(self):
+        """Entrypoint must exit nonzero if kernel IP forwarding cannot be disabled."""
+        self._create_default_mocks()
+        env = self._setup_multi_if_environment(ip_forward="1")
+        proc_ip_fwd = pathlib.Path(env["PROC_IP_FORWARD"])
+        # Set read-only so echo 0 fails to overwrite it
+        proc_ip_fwd.chmod(0o444)
+        try:
+            res = self._run_entrypoint(env_overrides=env)
+            self.assertNotEqual(res.returncode, 0)
+            self.assertIn("Kernel IPv4 forwarding is active", res.stdout + res.stderr)
+        finally:
+            proc_ip_fwd.chmod(0o666)
+
+    def test_multi_if_successful_complete_firewall_architecture(self):
+        """When multi-interface environment is configured, entrypoint installs and verifies complete INPUT, FORWARD, and OUTPUT architecture."""
+        self._create_default_mocks()
+        env = self._setup_multi_if_environment(internal_if="eth0", external_if="eth1")
+        res = self._run_entrypoint(env_overrides=env)
+
+        self.assertEqual(res.returncode, 0, f"Expected successful execution, got: {res.stderr}")
+        output = res.stdout + res.stderr
+        self.assertIn("Multi-interface topology configured", output)
+        self.assertIn("Network interface validation complete: INTERNAL_IF=eth0, EXTERNAL_IF=eth1", output)
+        self.assertIn("All multi-interface required IPv4 firewall rules installed successfully.", output)
+        self.assertIn("All multi-interface required IPv6 firewall rules installed successfully.", output)
+        self.assertIn("Multi-interface IPv4 kernel firewall ruleset verified: all required rules active.", output)
+        self.assertIn("Multi-interface IPv6 kernel firewall ruleset verified: all required rules active.", output)
+
+        log_lines = self.log_file.read_text(encoding="utf-8").splitlines()
+
+        # Verify FORWARD policy and rules
+        self.assertIn("iptables -P FORWARD DROP", log_lines)
+        self.assertIn("ip6tables -P FORWARD DROP", log_lines)
+        self.assertIn("iptables -A FORWARD -j DROP", log_lines)
+        self.assertIn("ip6tables -A FORWARD -j DROP", log_lines)
+        self.assertIn("iptables -C FORWARD -j DROP", log_lines)
+        self.assertIn("ip6tables -C FORWARD -j DROP", log_lines)
+
+        # Verify INPUT policy and rules
+        self.assertIn("iptables -P INPUT DROP", log_lines)
+        self.assertIn("ip6tables -P INPUT DROP", log_lines)
+        self.assertIn("iptables -A INPUT -i eth0 -p tcp --dport 8080 -m conntrack --ctstate NEW,ESTABLISHED -j ACCEPT", log_lines)
+        self.assertIn("iptables -C INPUT -i eth0 -p tcp --dport 8080 -m conntrack --ctstate NEW,ESTABLISHED -j ACCEPT", log_lines)
+
+        # Verify OUTPUT rules on internal vs external interface
+        installed_output_v4 = [
+            line[len("iptables -A OUTPUT "):]
+            for line in log_lines
+            if line.startswith("iptables -A OUTPUT ")
+        ]
+
+        # 1. Internal return traffic permitted ONLY on eth0, strictly for sport 8080 ESTABLISHED
+        internal_return_rule = "-o eth0 -p tcp --sport 8080 -m conntrack --ctstate ESTABLISHED -j ACCEPT"
+        self.assertIn(internal_return_rule, installed_output_v4)
+
+        # 2. Prohibited destination drops are present
+        self.assertIn("-d 172.16.0.0/12 -j DROP", installed_output_v4)
+        self.assertIn("-d 10.0.0.0/8 -j DROP", installed_output_v4)
+        self.assertIn("-d 169.254.169.254/32 -j DROP", installed_output_v4)
+
+        # 3. Internal return rule PRECEDES the 172.16.0.0/12 drop rule so established browser replies can exit eth0
+        int_ret_idx = installed_output_v4.index(internal_return_rule)
+        drop_172_idx = installed_output_v4.index("-d 172.16.0.0/12 -j DROP")
+        self.assertLess(int_ret_idx, drop_172_idx, "Internal sport 8080 return rule must precede 172.16.0.0/12 drop rule")
+
+        # 4. Outbound HTTP/HTTPS is strictly restricted to EXTERNAL_IF (eth1)
+        self.assertIn("-o eth1 -p tcp --dport 80 -j ACCEPT", installed_output_v4)
+        self.assertIn("-o eth1 -p tcp --dport 443 -j ACCEPT", installed_output_v4)
+        self.assertNotIn("-p tcp --dport 80 -j ACCEPT", installed_output_v4, "Plain un-scoped port 80 rule must not exist in multi-if mode")
+        self.assertNotIn("-p tcp --dport 443 -j ACCEPT", installed_output_v4, "Plain un-scoped port 443 rule must not exist in multi-if mode")
+
+        # 5. Default deny at end
+        self.assertEqual(installed_output_v4[-1], "-j DROP")
 
 
 if __name__ == "__main__":
