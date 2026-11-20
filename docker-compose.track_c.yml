@@ -1,0 +1,83 @@
+# -----------------------------------------------------------------------------
+# ScamShield AI — Track C Isolated Browser + Controlled Proxy Architecture
+# Docker Compose Specification (Stage 3)
+# 
+# Architecture:
+#   - Network 'browser_internal': internal bridge (internal: true), strictly no
+#     external default gateway or direct WAN egress.
+#   - Network 'proxy_external': standard bridge with outbound egress.
+#   - Service 'proxy': attached to BOTH networks. Acts as the sole egress gateway.
+#     Enforces dual-stack iptables filtering, DNS pinning, and blind TLS passthrough.
+#   - Service 'browser': attached EXCLUSIVELY to 'browser_internal'.
+#     Runs unprivileged Chromium (UID/GID 1001) with native sandbox and no direct WAN access.
+# -----------------------------------------------------------------------------
+
+services:
+  proxy:
+    image: scamshield-proxy-test:latest
+    build:
+      context: .
+      dockerfile: docker/proxy/Dockerfile
+    container_name: scamshield-track-c-proxy
+    cap_drop:
+      - ALL
+    cap_add:
+      - NET_ADMIN
+      - SETUID
+      - SETGID
+    security_opt:
+      - seccomp:docker/proxy/seccomp-proxy.json
+      - no-new-privileges:true
+    sysctls:
+      - net.ipv4.ip_forward=0
+    environment:
+      - PROXY_HOST=0.0.0.0
+      - PROXY_PORT=8080
+      - ALLOWED_EGRESS_PORTS=80,443
+      - INTERNAL_IF=eth0
+      - EXTERNAL_IF=eth1
+    networks:
+      proxy_external:
+      browser_internal:
+        aliases:
+          - proxy
+    healthcheck:
+      test: ["CMD-SHELL", "nc -z -w 2 127.0.0.1 8080 || exit 1"]
+      interval: 2s
+      timeout: 2s
+      retries: 15
+      start_period: 3s
+    restart: "no"
+
+  browser:
+    image: scamshield-browser-test:latest
+    build:
+      context: .
+      dockerfile: docker/browser/Dockerfile
+    container_name: scamshield-track-c-browser
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    environment:
+      - PROXY_SERVER=http://proxy:8080
+    networks:
+      - browser_internal
+    depends_on:
+      proxy:
+        condition: service_healthy
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: 2G
+    restart: "no"
+
+networks:
+  browser_internal:
+    name: scamshield_browser_internal
+    driver: bridge
+    internal: true
+  proxy_external:
+    name: scamshield_proxy_external
+    driver: bridge
